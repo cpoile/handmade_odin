@@ -6,6 +6,7 @@ import "core:fmt"
 import "core:log"
 import "core:strings"
 import win32 "core:sys/windows"
+import "../vendor/odin-xinput/xinput"
 
 // aliases
 L :: intrinsics.constant_utf16_cstring
@@ -28,7 +29,7 @@ win32_window_dimensions :: struct {
 	height: i32,
 }
 
-GlobalRunning := true
+global_running := true
 GlobalBackBuffer: offscreen_buffer
 
 get_window_dimensions :: proc(window: win32.HWND) -> win32_window_dimensions {
@@ -45,8 +46,8 @@ render_weird_gradient :: proc(xOffset: i32, yOffset: i32) {
 			//                   1  2  3  4
 			// pixel in memory: BB GG RR xx  (bc MSFT wanted to see RGB in register (see register)
 			//     in register: xx RR GG BB  (bc it's little endian)
-			bb := u8((x + xOffset) % 255)
-			gg := u8((y + yOffset) % 255)
+			bb := u8(x + xOffset)
+			gg := u8(y + yOffset)
 			pixel[0] = (u32(gg) << 8) | u32(bb)
 			pixel = pixel[1:]
 		}
@@ -112,37 +113,60 @@ win32_main_window_callback :: proc "system" (
 	WParam: win32.WPARAM,
 	LParam: win32.LPARAM,
 ) -> win32.LRESULT {
+	using win32
 	context = runtime.default_context()
 
-	result: win32.LRESULT
+	alt_is_down := false;
+
+	result: LRESULT
 	switch message {
-	case win32.WM_CREATE:
-		win32.OutputDebugStringA("WM_CREATE\n")
+	case WM_CREATE:
+		OutputDebugStringA("WM_CREATE\n")
 
-	case win32.WM_SIZE:
-		win32.OutputDebugStringA("WM_SIZE\n")
+	case WM_SIZE:
+		OutputDebugStringA("WM_SIZE\n")
 
-	case win32.WM_DESTROY:
-		GlobalRunning = false
-		win32.OutputDebugStringA("WM_DESTROY\n")
+	case WM_DESTROY:
+		global_running = false
+		OutputDebugStringA("WM_DESTROY\n")
 
-	case win32.WM_CLOSE:
-		GlobalRunning = false
-		win32.OutputDebugStringA("WM_CLOSE\n")
+	case WM_SYSKEYDOWN, WM_SYSKEYUP, WM_KEYDOWN, WM_KEYUP:
+		vk_code := WParam
+        wasDown := (LParam & (1 << 30)) != 0
+        isDown := (LParam & (1 << 31)) == 0
+        if (isDown != wasDown) {
+            // NOTE: not real code, just a placeholder, later we'll use a switch or something.
+            if      vk_code == VK_MENU    {alt_is_down = isDown}
+            else if vk_code == VK_F4      {global_running = false}
+            else if vk_code == 'W'        {OutputDebugStringA("W\n")}
+            else if vk_code == 'A'        {OutputDebugStringA("A\n")}
+            else if vk_code == 'R'        {OutputDebugStringA("R\n")}
+            else if vk_code == 'S'        {OutputDebugStringA("S\n")}
+            else if vk_code == 'Q'        {OutputDebugStringA("Q\n")}
+            else if vk_code == 'F'        {OutputDebugStringA("F\n")}
+            else if vk_code == VK_UP      {OutputDebugStringA("up\n")}
+            else if vk_code == VK_DOWN    {OutputDebugStringA("down\n")}
+            else if vk_code == VK_LEFT    {OutputDebugStringA("left\n")}
+            else if vk_code == VK_RIGHT   {OutputDebugStringA("Right\n")}
+            else if vk_code == VK_ESCAPE  {OutputDebugStringA(strings.unsafe_string_to_cstring(fmt.tprintf("Escape is down? %t was down? %t\n", isDown, wasDown)))}
+		}
 
-	case win32.WM_ACTIVATEAPP:
-		win32.OutputDebugStringA("WM_ACTIVATEAPP\n")
+	case WM_CLOSE:
+		global_running = false
+		OutputDebugStringA("WM_CLOSE\n")
 
-	case win32.WM_PAINT:
-		paint: win32.PAINTSTRUCT
-		deviceContext: win32.HDC = win32.BeginPaint(window, &paint)
+	case WM_ACTIVATEAPP:
+		OutputDebugStringA("WM_ACTIVATEAPP\n")
+
+	case WM_PAINT:
+		paint: PAINTSTRUCT
+		device_context: HDC = BeginPaint(window, &paint)
+		defer EndPaint(window, &paint)
 		dims: win32_window_dimensions = get_window_dimensions(window)
-
-		win32_display_buffer_in_window(deviceContext, dims.width, dims.height)
-		win32.EndPaint(window, &paint)
+		win32_display_buffer_in_window(device_context, dims.width, dims.height)
 
 	case:
-		result = win32.DefWindowProcA(window, message, WParam, LParam)
+		result = DefWindowProcA(window, message, WParam, LParam)
 	}
 
 	return result
@@ -231,24 +255,54 @@ main :: proc() {
 	yOffset: i32 = 0
 
 	message: win32.MSG
-	for (GlobalRunning) {
+	for (global_running) {
 		if win32.PeekMessageA(&message, nil, 0, 0, win32.PM_REMOVE) {
-			if message.message == win32.WM_QUIT {GlobalRunning = false}
+			if message.message == win32.WM_QUIT {global_running = false}
 
 			win32.TranslateMessage(&message)
 			win32.DispatchMessageW(&message)
 		}
+
+		// TODO: not sure about polling frequency yet.
+		using xinput
+
+		packet_number: win32.DWORD
+		for user in XUSER {
+			state: XINPUT_STATE
+			if result := XInputGetState(user, &state); result == .SUCCESS {
+				if packet_number == state.dwPacketNumber do continue
+
+                pad := state.Gamepad
+                up := .DPAD_UP in pad.wButtons
+                down := .DPAD_DOWN in pad.wButtons
+                left := .DPAD_LEFT in pad.wButtons
+                right := .DPAD_RIGHT in pad.wButtons
+                start := .START in pad.wButtons
+                back := .BACK in pad.wButtons
+                left_shoulder := .LEFT_SHOULDER in pad.wButtons
+                right_shoulder := .RIGHT_SHOULDER in pad.wButtons
+                a_button := .A in pad.wButtons
+                b_button := .B in pad.wButtons
+                x_button := .X in pad.wButtons
+                y_button := .Y in pad.wButtons
+
+				stick_x := pad.sThumbLX
+                stick_y := pad.sThumbLY
+
+				xOffset += i32(stick_x >> 12)
+                yOffset -= i32(stick_y >> 12)
+            }
+        }
+
+        // vibration: XINPUT_VIBRATION = {60000, 60000};
+		// XInputSetState(0, &vibration)
 
 		render_weird_gradient(xOffset, yOffset)
 
 		dims := get_window_dimensions(windowHandle)
 
 		win32_display_buffer_in_window(deviceContext, dims.width, dims.height)
-
-		xOffset += 1
-		yOffset += 2
 	}
-
 }
 
 show_error_and_panic :: proc(msg: string) {
