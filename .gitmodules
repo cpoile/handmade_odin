@@ -1,0 +1,3 @@
+[submodule "vendor/backtrace"]
+	path = vendor/backtrace
+	url = https://github.com/laytan/back.git

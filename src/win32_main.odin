@@ -1,16 +1,23 @@
 package main
 
+import "../vendor/backtrace"
+import "../vendor/dsound"
+import "../vendor/odin-xinput/xinput"
 import "base:intrinsics"
 import "base:runtime"
+import "core:dynlib"
 import "core:fmt"
 import "core:log"
 import "core:strings"
 import win32 "core:sys/windows"
-import "../vendor/odin-xinput/xinput"
 
 // aliases
 L :: intrinsics.constant_utf16_cstring
 int2 :: [2]i32
+
+// consts
+SAMPLE_RATE :: 44100
+BUFFER_SIZE :: SAMPLE_RATE * size_of(u16) * 2
 
 Game :: struct {
 	size: int2,
@@ -31,6 +38,7 @@ win32_window_dimensions :: struct {
 
 global_running := true
 GlobalBackBuffer: offscreen_buffer
+secondary_buffer: ^dsound.Buffer
 
 get_window_dimensions :: proc(window: win32.HWND) -> win32_window_dimensions {
 	client_rect: win32.RECT
@@ -57,8 +65,7 @@ render_weird_gradient :: proc(xOffset: i32, yOffset: i32) {
 }
 
 win32_resize_DIB_section :: proc(width: i32, height: i32) {
-	if (GlobalBackBuffer.memory !=
-		   nil) {win32.VirtualFree(GlobalBackBuffer.memory, 0, win32.MEM_RELEASE)}
+	if (GlobalBackBuffer.memory != nil) {win32.VirtualFree(GlobalBackBuffer.memory, 0, win32.MEM_RELEASE)}
 	GlobalBackBuffer.width = width
 	GlobalBackBuffer.height = height
 	bytes_per_pixel :: 4
@@ -67,23 +74,19 @@ win32_resize_DIB_section :: proc(width: i32, height: i32) {
 	// NOTE: When the biHeight field is negative, this is the clue to Windows to treat this bitmap as top down, not
 	// bottom up, meaning that the first 3 bytes of the image are the color for the top left pixel in the bitmap,
 	// not the bottom left
-	GlobalBackBuffer.BitmapInfo.bmiHeader.biSize = size_of(
-		type_of(GlobalBackBuffer.BitmapInfo.bmiHeader),
-	)
+	GlobalBackBuffer.BitmapInfo.bmiHeader.biSize = size_of(type_of(GlobalBackBuffer.BitmapInfo.bmiHeader))
 	GlobalBackBuffer.BitmapInfo.bmiHeader.biWidth = width
 	GlobalBackBuffer.BitmapInfo.bmiHeader.biHeight = -height
 	GlobalBackBuffer.BitmapInfo.bmiHeader.biPlanes = 1
 	GlobalBackBuffer.BitmapInfo.bmiHeader.biBitCount = 32
 	GlobalBackBuffer.BitmapInfo.bmiHeader.biCompression = win32.BI_RGB
 
-	bitmap_memory_size := uint(
-		(GlobalBackBuffer.width * GlobalBackBuffer.height) * bytes_per_pixel,
-	)
+	bitmap_memory_size := uint((GlobalBackBuffer.width * GlobalBackBuffer.height) * bytes_per_pixel)
 	GlobalBackBuffer.memory =
 	transmute([^]u8)win32.VirtualAlloc(
 		nil,
 		bitmap_memory_size,
-		win32.MEM_COMMIT,
+		win32.MEM_RESERVE | win32.MEM_COMMIT,
 		win32.PAGE_READWRITE,
 	)
 }
@@ -116,7 +119,7 @@ win32_main_window_callback :: proc "system" (
 	using win32
 	context = runtime.default_context()
 
-	alt_is_down := false;
+	alt_is_down := false
 
 	result: LRESULT
 	switch message {
@@ -132,23 +135,36 @@ win32_main_window_callback :: proc "system" (
 
 	case WM_SYSKEYDOWN, WM_SYSKEYUP, WM_KEYDOWN, WM_KEYUP:
 		vk_code := WParam
-        wasDown := (LParam & (1 << 30)) != 0
-        isDown := (LParam & (1 << 31)) == 0
-        if (isDown != wasDown) {
-            // NOTE: not real code, just a placeholder, later we'll use a switch or something.
-            if      vk_code == VK_MENU    {alt_is_down = isDown}
-            else if vk_code == VK_F4      {global_running = false}
-            else if vk_code == 'W'        {OutputDebugStringA("W\n")}
-            else if vk_code == 'A'        {OutputDebugStringA("A\n")}
-            else if vk_code == 'R'        {OutputDebugStringA("R\n")}
-            else if vk_code == 'S'        {OutputDebugStringA("S\n")}
-            else if vk_code == 'Q'        {OutputDebugStringA("Q\n")}
-            else if vk_code == 'F'        {OutputDebugStringA("F\n")}
-            else if vk_code == VK_UP      {OutputDebugStringA("up\n")}
-            else if vk_code == VK_DOWN    {OutputDebugStringA("down\n")}
-            else if vk_code == VK_LEFT    {OutputDebugStringA("left\n")}
-            else if vk_code == VK_RIGHT   {OutputDebugStringA("Right\n")}
-            else if vk_code == VK_ESCAPE  {OutputDebugStringA(strings.unsafe_string_to_cstring(fmt.tprintf("Escape is down? %t was down? %t\n", isDown, wasDown)))}
+		altDown := (LParam & (1 << 29)) != 0
+		wasDown := (LParam & (1 << 30)) != 0
+		isDown := (LParam & (1 << 31)) == 0
+		if (isDown != wasDown) {
+			switch vk_code {
+			case VK_F4:
+				if altDown {global_running = false}
+			case 'W':
+				OutputDebugStringA("W\n")
+			case 'A':
+				OutputDebugStringA("A\n")
+			case 'R':
+				OutputDebugStringA("R\n")
+			case 'S':
+				OutputDebugStringA("S\n")
+			case 'Q':
+				OutputDebugStringA("Q\n")
+			case 'F':
+				OutputDebugStringA("F\n")
+			case VK_UP:
+				OutputDebugStringA("up\n")
+			case VK_DOWN:
+				OutputDebugStringA("down\n")
+			case VK_LEFT:
+				OutputDebugStringA("left\n")
+			case VK_RIGHT:
+				OutputDebugStringA("Right\n")
+			case VK_ESCAPE:
+				OutputDebugStringA(fmt.ctprintf("Escape is down? %t was down? %t\n", isDown, wasDown))
+			}
 		}
 
 	case WM_CLOSE:
@@ -191,10 +207,7 @@ register_class :: proc(instance: win32.HINSTANCE) -> win32.ATOM {
 
 unregister_class :: proc(atom: win32.ATOM, instance: win32.HINSTANCE) {
 	if atom == 0 {show_error_and_panic("atom is zero")}
-	if !win32.UnregisterClassW(
-		win32.LPCWSTR(uintptr(atom)),
-		instance,
-	) {show_error_and_panic("UnregisterClassW")}
+	if !win32.UnregisterClassW(win32.LPCWSTR(uintptr(atom)), instance) {show_error_and_panic("UnregisterClassW")}
 }
 
 adjust_size_for_style :: proc(size: ^int2, dwStyle: win32.DWORD) {
@@ -204,11 +217,7 @@ adjust_size_for_style :: proc(size: ^int2, dwStyle: win32.DWORD) {
 	}
 }
 
-create_window :: #force_inline proc(
-	instance: win32.HINSTANCE,
-	atom: win32.ATOM,
-	game: ^Game,
-) -> win32.HWND {
+create_window :: #force_inline proc(instance: win32.HINSTANCE, atom: win32.ATOM, game: ^Game) -> win32.HWND {
 	if atom == 0 {show_error_and_panic("atom is zero")}
 	style :: win32.WS_OVERLAPPEDWINDOW
 	pos := int2{i32(win32.CW_USEDEFAULT), i32(win32.CW_USEDEFAULT)}
@@ -230,6 +239,8 @@ create_window :: #force_inline proc(
 }
 
 main :: proc() {
+	backtrace.register_segfault_handler()
+
 	game := Game {
 		size = {1280, 720},
 	}
@@ -247,12 +258,14 @@ main :: proc() {
 
 	win32_resize_DIB_section(game.size.x, game.size.y)
 
-	// NOTE: since we specified CS_OWNDC (in Window_Creation/windows.jai), we can just get one device context and use it
+	// NOTE: since we specified CS_OWNDC, we can just get one device context and use it
 	// forever because we are not sharing it with anyone.
 	deviceContext := win32.GetDC(windowHandle)
 
 	xOffset: i32 = 0
 	yOffset: i32 = 0
+
+	dsound.load(windowHandle, &secondary_buffer, BUFFER_SIZE, SAMPLE_RATE)
 
 	message: win32.MSG
 	for (global_running) {
@@ -263,38 +276,39 @@ main :: proc() {
 			win32.DispatchMessageW(&message)
 		}
 
-		// TODO: not sure about polling frequency yet.
+
 		using xinput
 
+		// TODO: not sure about polling frequency yet.
 		packet_number: win32.DWORD
 		for user in XUSER {
 			state: XINPUT_STATE
 			if result := XInputGetState(user, &state); result == .SUCCESS {
 				if packet_number == state.dwPacketNumber do continue
 
-                pad := state.Gamepad
-                up := .DPAD_UP in pad.wButtons
-                down := .DPAD_DOWN in pad.wButtons
-                left := .DPAD_LEFT in pad.wButtons
-                right := .DPAD_RIGHT in pad.wButtons
-                start := .START in pad.wButtons
-                back := .BACK in pad.wButtons
-                left_shoulder := .LEFT_SHOULDER in pad.wButtons
-                right_shoulder := .RIGHT_SHOULDER in pad.wButtons
-                a_button := .A in pad.wButtons
-                b_button := .B in pad.wButtons
-                x_button := .X in pad.wButtons
-                y_button := .Y in pad.wButtons
+				pad := state.Gamepad
+				up := .DPAD_UP in pad.wButtons
+				down := .DPAD_DOWN in pad.wButtons
+				left := .DPAD_LEFT in pad.wButtons
+				right := .DPAD_RIGHT in pad.wButtons
+				start := .START in pad.wButtons
+				back := .BACK in pad.wButtons
+				left_shoulder := .LEFT_SHOULDER in pad.wButtons
+				right_shoulder := .RIGHT_SHOULDER in pad.wButtons
+				a_button := .A in pad.wButtons
+				b_button := .B in pad.wButtons
+				x_button := .X in pad.wButtons
+				y_button := .Y in pad.wButtons
 
 				stick_x := pad.sThumbLX
-                stick_y := pad.sThumbLY
+				stick_y := pad.sThumbLY
 
 				xOffset += i32(stick_x >> 12)
-                yOffset -= i32(stick_y >> 12)
-            }
-        }
+				yOffset -= i32(stick_y >> 12)
+			}
+		}
 
-        // vibration: XINPUT_VIBRATION = {60000, 60000};
+		// vibration: XINPUT_VIBRATION = {60000, 60000};
 		// XInputSetState(0, &vibration)
 
 		render_weird_gradient(xOffset, yOffset)
