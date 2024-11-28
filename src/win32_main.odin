@@ -16,8 +16,9 @@ L :: intrinsics.constant_utf16_cstring
 int2 :: [2]i32
 
 // consts
-SAMPLE_RATE :: 44100
-BUFFER_SIZE :: SAMPLE_RATE * size_of(u16) * 2
+SAMPLE_RATE: u32 : 44100
+BYTES_PER_SAMPLE :: size_of(u16) * 2
+BUFFER_SIZE :: SAMPLE_RATE * BYTES_PER_SAMPLE
 
 Game :: struct {
 	size: int2,
@@ -262,10 +263,22 @@ main :: proc() {
 	// forever because we are not sharing it with anyone.
 	deviceContext := win32.GetDC(windowHandle)
 
+	// NOTE: graphics test
 	xOffset: i32 = 0
 	yOffset: i32 = 0
 
+	// NOTE: sound test
+	tone_hz: u32 = 261
+	volume: i16 = 3000
+	running_sample_index: u32 = 0
+	square_wave_period: u32 = SAMPLE_RATE / tone_hz
+	half_square_wave_period: u32 = square_wave_period / 2
+
 	dsound.load(windowHandle, &secondary_buffer, BUFFER_SIZE, SAMPLE_RATE)
+	if hr := secondary_buffer->play(0, 0, dsound.DSBPLAY_LOOPING); hr < 0 {
+		_, _, code := win32.DECODE_HRESULT(hr)
+		fmt.eprintf("Error in Play: code 0x%X\n", code)
+	}
 
 	message: win32.MSG
 	for (global_running) {
@@ -312,6 +325,61 @@ main :: proc() {
 		// XInputSetState(0, &vibration)
 
 		render_weird_gradient(xOffset, yOffset)
+
+		// DirectSound output test
+		play_cursor, write_cursor: u32
+		if hr := secondary_buffer->getCurrentPosition(&play_cursor, &write_cursor); hr < 0 {
+			_, _, code := win32.DECODE_HRESULT(hr)
+			fmt.eprintf("Error in GetCurrentPosition: code 0x%X\n", code)
+			return
+		}
+
+		bytes_to_lock: u32 = (running_sample_index * BYTES_PER_SAMPLE) % BUFFER_SIZE
+		bytes_to_write: u32
+
+		if bytes_to_lock > play_cursor {
+			bytes_to_write = BUFFER_SIZE - bytes_to_lock // we have this much ahead of us in the buffer to write to
+			bytes_to_write += play_cursor // and add the first part of the buffer up to the play cursor
+		} else {
+			bytes_to_write = play_cursor - bytes_to_lock // we only have to fill from bytes_to_lock up to the play_cursor
+		}
+
+		//  u16   u16     u16   u16    u16   u16
+		// [left right] [left right] [left right]
+		region1, region2: rawptr
+		size1, size2: u32
+		hr := secondary_buffer->lock(write_cursor, bytes_to_write, &region1, &size1, &region2, &size2, 0)
+		if hr < 0 {
+			_, _, code := win32.DECODE_HRESULT(hr)
+			fmt.eprintf("Error in Lock: code 0x%X\n", code)
+		} else {
+			fmt.eprintf("GOT LOCK!\n")
+			sample_out := transmute([^]i16)region1
+			region1_sample_count := size1 / BYTES_PER_SAMPLE
+			for i in 0 ..< region1_sample_count {
+				sample_value := ((running_sample_index / half_square_wave_period) % 2) == 1 ? volume : -volume
+				sample_out[0] = sample_value
+				sample_out = sample_out[1:]
+				sample_out[0] = sample_value
+				sample_out = sample_out[1:]
+				running_sample_index += 1
+			}
+
+			sample_out = transmute([^]i16)region2
+			region2_sample_count := size2 / BYTES_PER_SAMPLE
+			for i in 0 ..< region2_sample_count {
+				sample_value := ((running_sample_index / half_square_wave_period) % 2) == 1 ? volume : -volume
+				sample_out[0] = sample_value
+				sample_out = sample_out[1:]
+				sample_out[0] = sample_value
+				sample_out = sample_out[1:]
+				running_sample_index += 1
+			}
+			if hr = secondary_buffer->unlock(region1, size1, region2, size2); hr < 0 {
+				_, _, code := win32.DECODE_HRESULT(hr)
+				fmt.eprintf("Error in Unlock: code 0x%X\n", code)
+			}
+		}
 
 		dims := get_window_dimensions(windowHandle)
 
