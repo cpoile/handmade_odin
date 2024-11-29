@@ -9,6 +9,7 @@ import "core:dynlib"
 import "core:fmt"
 import "core:log"
 import "core:math"
+import "core:simd/x86"
 import "core:strings"
 import win32 "core:sys/windows"
 
@@ -296,6 +297,9 @@ create_window :: #force_inline proc(instance: win32.HINSTANCE, atom: win32.ATOM,
 }
 
 main :: proc() {
+	perf_counter_frequency: win32.LARGE_INTEGER
+	win32.QueryPerformanceFrequency(&perf_counter_frequency)
+
 	backtrace.register_segfault_handler()
 
 	game := Game {
@@ -338,6 +342,10 @@ main :: proc() {
 		fmt.eprintf("Error in Play: code 0x%X\n", code)
 		return
 	}
+
+	last_counter: win32.LARGE_INTEGER
+	last_cycle_count := x86._rdtsc()
+	win32.QueryPerformanceCounter(&last_counter)
 
 	message: win32.MSG
 	for (global_running) {
@@ -414,6 +422,26 @@ main :: proc() {
 		dims := get_window_dimensions(windowHandle)
 
 		win32_display_buffer_in_window(deviceContext, dims.width, dims.height)
+
+		// Frame timings
+		end_counter: win32.LARGE_INTEGER
+        win32.QueryPerformanceCounter(&end_counter)
+
+        counter_elapsed := end_counter - last_counter
+        ms_elapsed := f32(1000 * counter_elapsed) / f32(perf_counter_frequency)
+        fps := f32(perf_counter_frequency) / f32(counter_elapsed)
+
+        //  5.5367, FPS: 180.613007, cycles: 16
+        // using rdtsc
+        end_cycle_count := x86._rdtsc()
+        cycles_elapsed := end_cycle_count - last_cycle_count
+        mcpf := cycles_elapsed / (1000 * 1000)
+
+        win32.OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
+
+        last_counter = end_counter
+        last_cycle_count = end_cycle_count
+
 	}
 }
 
