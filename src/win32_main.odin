@@ -1,5 +1,25 @@
 package main
 
+/* TODO: This is not the final platform layer!
+
+  - Saved game locations
+  - Getting a handle to our own executable file
+  - Asset loading path
+  - Threading (launch a thread)
+  - Raw input (support for multiple keyboards)
+  - Sleep/timeBeginPeriod
+  - ClipCursor() (for muliple monitor supprot)
+  - Fullscreen support
+  - WM_SETCURSOR (control cursor visibility)
+  - QueryCancelAutoplay
+  - WM_ACTIVATEAPP (for when we are not the active application)
+  - Blit speed improvements (BitBlt)
+  - Hardware acceleration (OpenGL or Direct3D or BOTH??)
+  - GetKeyboardLayout (for French keyboards, international WASD support)
+
+  Just a partial list of stuff!
+*/
+
 import "../vendor/backtrace"
 import "../vendor/dsound"
 import "../vendor/odin-xinput/xinput"
@@ -40,7 +60,7 @@ win32_window_dimensions :: struct {
 }
 
 win32_sound_output :: struct {
-	tone_hz:              f32,  // TODO: f32?
+	tone_hz:              f32, // TODO: f32?
 	volume:               i16,
 	running_sample_index: u32,
 	wave_period:          f32, // TODO: f32?
@@ -104,43 +124,25 @@ get_window_dimensions :: proc(window: win32.HWND) -> win32_window_dimensions {
 	return {client_rect.right - client_rect.left, client_rect.bottom - client_rect.top}
 }
 
-render_weird_gradient :: proc(xOffset: i32, yOffset: i32) {
-	row := GlobalBackBuffer.memory
-	for y in 0 ..< GlobalBackBuffer.height {
-		pixel := transmute([^]u32)row
-		for x in 0 ..< GlobalBackBuffer.width {
-			//                   1  2  3  4
-			// pixel in memory: BB GG RR xx  (bc MSFT wanted to see RGB in register (see register)
-			//     in register: xx RR GG BB  (bc it's little endian)
-			bb := u8(x + xOffset)
-			gg := u8(y + yOffset)
-			pixel[0] = (u32(gg) << 8) | u32(bb)
-			pixel = pixel[1:]
-		}
-
-		row = row[GlobalBackBuffer.pitch:]
-	}
-}
-
-win32_resize_DIB_section :: proc(width: i32, height: i32) {
-	if (GlobalBackBuffer.memory != nil) {win32.VirtualFree(GlobalBackBuffer.memory, 0, win32.MEM_RELEASE)}
-	GlobalBackBuffer.width = width
-	GlobalBackBuffer.height = height
+win32_resize_DIB_section :: proc(back_buffer: ^offscreen_buffer, width: i32, height: i32) {
+	if (back_buffer.memory != nil) {win32.VirtualFree(back_buffer.memory, 0, win32.MEM_RELEASE)}
+	back_buffer.width = width
+	back_buffer.height = height
 	bytes_per_pixel :: 4
-	GlobalBackBuffer.pitch = width * bytes_per_pixel
+	back_buffer.pitch = width * bytes_per_pixel
 
 	// NOTE: When the biHeight field is negative, this is the clue to Windows to treat this bitmap as top down, not
 	// bottom up, meaning that the first 3 bytes of the image are the color for the top left pixel in the bitmap,
 	// not the bottom left
-	GlobalBackBuffer.BitmapInfo.bmiHeader.biSize = size_of(type_of(GlobalBackBuffer.BitmapInfo.bmiHeader))
-	GlobalBackBuffer.BitmapInfo.bmiHeader.biWidth = width
-	GlobalBackBuffer.BitmapInfo.bmiHeader.biHeight = -height
-	GlobalBackBuffer.BitmapInfo.bmiHeader.biPlanes = 1
-	GlobalBackBuffer.BitmapInfo.bmiHeader.biBitCount = 32
-	GlobalBackBuffer.BitmapInfo.bmiHeader.biCompression = win32.BI_RGB
+	back_buffer.BitmapInfo.bmiHeader.biSize = size_of(type_of(back_buffer.BitmapInfo.bmiHeader))
+	back_buffer.BitmapInfo.bmiHeader.biWidth = width
+	back_buffer.BitmapInfo.bmiHeader.biHeight = -height
+	back_buffer.BitmapInfo.bmiHeader.biPlanes = 1
+	back_buffer.BitmapInfo.bmiHeader.biBitCount = 32
+	back_buffer.BitmapInfo.bmiHeader.biCompression = win32.BI_RGB
 
-	bitmap_memory_size := uint((GlobalBackBuffer.width * GlobalBackBuffer.height) * bytes_per_pixel)
-	GlobalBackBuffer.memory =
+	bitmap_memory_size := uint((back_buffer.width * back_buffer.height) * bytes_per_pixel)
+	back_buffer.memory =
 	transmute([^]u8)win32.VirtualAlloc(
 		nil,
 		bitmap_memory_size,
@@ -149,7 +151,7 @@ win32_resize_DIB_section :: proc(width: i32, height: i32) {
 	)
 }
 
-win32_display_buffer_in_window :: proc(deviceContext: win32.HDC, destWidth: i32, destHeight: i32) {
+win32_display_buffer_in_window :: proc(back_buffer: ^offscreen_buffer, deviceContext: win32.HDC, destWidth: i32, destHeight: i32) {
 	// TODO: aspect ratio correction
 	win32.StretchDIBits(
 		deviceContext,
@@ -159,10 +161,10 @@ win32_display_buffer_in_window :: proc(deviceContext: win32.HDC, destWidth: i32,
 		destHeight,
 		0,
 		0,
-		GlobalBackBuffer.width,
-		GlobalBackBuffer.height,
-		GlobalBackBuffer.memory,
-		&GlobalBackBuffer.BitmapInfo,
+		back_buffer.width,
+		back_buffer.height,
+		back_buffer.memory,
+		&back_buffer.BitmapInfo,
 		win32.DIB_RGB_COLORS,
 		win32.SRCCOPY,
 	)
@@ -237,7 +239,7 @@ win32_main_window_callback :: proc "system" (
 		device_context: HDC = BeginPaint(window, &paint)
 		defer EndPaint(window, &paint)
 		dims: win32_window_dimensions = get_window_dimensions(window)
-		win32_display_buffer_in_window(device_context, dims.width, dims.height)
+		win32_display_buffer_in_window(&GlobalBackBuffer, device_context, dims.width, dims.height)
 
 	case:
 		result = DefWindowProcA(window, message, WParam, LParam)
@@ -317,7 +319,7 @@ main :: proc() {
 	win32.ShowWindow(windowHandle, win32.SW_SHOWDEFAULT)
 	win32.UpdateWindow(windowHandle)
 
-	win32_resize_DIB_section(game.size.x, game.size.y)
+	win32_resize_DIB_section(&GlobalBackBuffer, game.size.x, game.size.y)
 
 	// NOTE: since we specified CS_OWNDC, we can just get one device context and use it
 	// forever because we are not sharing it with anyone.
@@ -329,11 +331,11 @@ main :: proc() {
 
 	// NOTE: sound test
 	sound_output := win32_sound_output {
-		tone_hz              = 261,
-		volume               = 10000,
+		tone_hz = 261,
+		volume  = 10000,
 	}
 	sound_output.wave_period = f32(SAMPLE_RATE) / sound_output.tone_hz
-	sound_output.latency_sample_count = SAMPLE_RATE/20
+	sound_output.latency_sample_count = SAMPLE_RATE / 20
 
 	dsound.load(windowHandle, &secondary_buffer, BUFFER_SIZE, SAMPLE_RATE)
 	win32_fill_sound_buffer(&sound_output, 0, sound_output.latency_sample_count * BYTES_PER_SAMPLE)
@@ -384,20 +386,26 @@ main :: proc() {
 				stick_y := pad.sThumbLY
 
 				// NOTE: we will do proper deadzone handling later:
-                // XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
-                // XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
+				// XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
+				// XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
 				xOffset += i32(stick_x / 4096)
 				yOffset -= i32(stick_y / 4096)
 
 				sound_output.tone_hz = math.clamp(512 + 32.0 * f32(stick_y / 2000.0), 100, 1566)
-                sound_output.wave_period = f32(SAMPLE_RATE)/sound_output.tone_hz
+				sound_output.wave_period = f32(SAMPLE_RATE) / sound_output.tone_hz
 			}
 		}
 
 		// vibration: XINPUT_VIBRATION = {60000, 60000};
 		// XInputSetState(0, &vibration)
 
-		render_weird_gradient(xOffset, yOffset)
+		buffer := game_offscreen_buffer{
+			memory = GlobalBackBuffer.memory,
+			width = GlobalBackBuffer.width,
+			height = GlobalBackBuffer.height,
+			pitch = GlobalBackBuffer.pitch,
+		}
+		game_update_and_render(&buffer, xOffset, yOffset)
 
 		// DirectSound output test
 		play_cursor, write_cursor: u32
@@ -421,26 +429,26 @@ main :: proc() {
 
 		dims := get_window_dimensions(windowHandle)
 
-		win32_display_buffer_in_window(deviceContext, dims.width, dims.height)
+		win32_display_buffer_in_window(&GlobalBackBuffer, deviceContext, dims.width, dims.height)
 
 		// Frame timings
 		end_counter: win32.LARGE_INTEGER
-        win32.QueryPerformanceCounter(&end_counter)
+		win32.QueryPerformanceCounter(&end_counter)
 
-        counter_elapsed := end_counter - last_counter
-        ms_elapsed := f32(1000 * counter_elapsed) / f32(perf_counter_frequency)
-        fps := f32(perf_counter_frequency) / f32(counter_elapsed)
+		counter_elapsed := end_counter - last_counter
+		ms_elapsed := f32(1000 * counter_elapsed) / f32(perf_counter_frequency)
+		fps := f32(perf_counter_frequency) / f32(counter_elapsed)
 
-        //  5.5367, FPS: 180.613007, cycles: 16
-        // using rdtsc
-        end_cycle_count := x86._rdtsc()
-        cycles_elapsed := end_cycle_count - last_cycle_count
-        mcpf := cycles_elapsed / (1000 * 1000)
+		//  5.5367, FPS: 180.613007, cycles: 16
+		// using rdtsc
+		end_cycle_count := x86._rdtsc()
+		cycles_elapsed := end_cycle_count - last_cycle_count
+		mcpf := cycles_elapsed / (1000 * 1000)
 
-        win32.OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
+		win32.OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
 
-        last_counter = end_counter
-        last_cycle_count = end_cycle_count
+		last_counter = end_counter
+		last_cycle_count = end_cycle_count
 
 	}
 }
