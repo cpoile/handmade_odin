@@ -39,7 +39,7 @@ int2 :: [2]i32
 
 // consts
 SAMPLE_RATE: u32 : 44100
-BYTES_PER_SAMPLE :: size_of(u16) * 2
+BYTES_PER_SAMPLE :: size_of(i16) * 2
 BUFFER_SIZE :: SAMPLE_RATE * BYTES_PER_SAMPLE
 
 Game :: struct {
@@ -48,7 +48,7 @@ Game :: struct {
 
 offscreen_buffer :: struct {
 	BitmapInfo: win32.BITMAPINFO,
-	memory:     [^]u8,
+	memory:     []byte,
 	width:      i32,
 	height:     i32,
 	pitch:      i32,
@@ -60,61 +60,55 @@ win32_window_dimensions :: struct {
 }
 
 win32_sound_output :: struct {
-	tone_hz:              f32, // TODO: f32?
-	volume:               i16,
+	tone_hz:              u32, // TODO: f32?
+	volume:               u16,
 	running_sample_index: u32,
-	wave_period:          f32, // TODO: f32?
+	wave_period:          u32, // TODO: f32?
 	tSine:                f32,
 	latency_sample_count: u32,
 }
 
-
 global_running := true
 GlobalBackBuffer: offscreen_buffer
-secondary_buffer: ^dsound.Buffer
+secondary_sound_buffer: ^dsound.Buffer
 
-win32_fill_sound_buffer :: proc(sound_output: ^win32_sound_output, byte_to_lock, bytes_to_write: u32) {
+win32_fill_sound_buffer :: proc(
+	sound_output: ^win32_sound_output,
+	source_buffer: ^Game_Sound_Buffer,
+	byte_to_lock, bytes_to_write: u32,
+) {
 	//  u16   u16     u16   u16    u16   u16
 	// [left right] [left right] [left right]
 	region1, region2: rawptr
 	size1, size2: u32
-	hr := secondary_buffer->lock(byte_to_lock, bytes_to_write, &region1, &size1, &region2, &size2, 0)
-	if hr < 0 {
-		//_, _, code := win32.DECODE_HRESULT(hr)
-		//fmt.eprintf("Error in Lock: code 0x%X\n", code)
-	} else {
-		//fmt.eprintf("GOT LOCK!\n")
-		sample_out := transmute([^]i16)region1
+	if win32.SUCCEEDED(secondary_sound_buffer->lock(byte_to_lock, bytes_to_write, &region1, &size1, &region2, &size2, 0)) {
 		region1_sample_count := size1 / BYTES_PER_SAMPLE
+		dest_samples := transmute([^]i16)region1
+		src_samples := source_buffer.samples
 		for i in 0 ..< region1_sample_count {
-			sine_val := math.sin_f32(sound_output.tSine)
-			sample_value := i16(sine_val * f32(sound_output.volume))
-			sample_out[0] = sample_value
-			sample_out = sample_out[1:]
-			sample_out[0] = sample_value
-			sample_out = sample_out[1:]
+			dest_samples[0] = src_samples[0]
+			dest_samples = dest_samples[1:]
+			src_samples = src_samples[1:]
 
-			sound_output.tSine += 2.0 * math.PI / sound_output.wave_period
+			dest_samples[0] = src_samples[0]
+			dest_samples = dest_samples[1:]
+			src_samples = src_samples[1:]
 			sound_output.running_sample_index += 1
 		}
 
-		sample_out = transmute([^]i16)region2
+		dest_samples = transmute([^]i16)region2
 		region2_sample_count := size2 / BYTES_PER_SAMPLE
 		for i in 0 ..< region2_sample_count {
-			sine_val := math.sin_f32(sound_output.tSine)
-			sample_value := i16(sine_val * f32(sound_output.volume))
-			sample_out[0] = sample_value
-			sample_out = sample_out[1:]
-			sample_out[0] = sample_value
-			sample_out = sample_out[1:]
+			dest_samples[0] = src_samples[0]
+			dest_samples = dest_samples[1:]
+			src_samples = src_samples[1:]
 
-			sound_output.tSine += 2.0 * math.PI / sound_output.wave_period
+			dest_samples[0] = src_samples[0]
+			dest_samples = dest_samples[1:]
+			src_samples = src_samples[1:]
 			sound_output.running_sample_index += 1
 		}
-		if hr = secondary_buffer->unlock(region1, size1, region2, size2); hr < 0 {
-			//_, _, code := win32.DECODE_HRESULT(hr)
-			//fmt.eprintf("Error in Unlock: code 0x%X\n", code)
-		}
+		secondary_sound_buffer->unlock(region1, size1, region2, size2)
 	}
 }
 
@@ -125,7 +119,7 @@ get_window_dimensions :: proc(window: win32.HWND) -> win32_window_dimensions {
 }
 
 win32_resize_DIB_section :: proc(back_buffer: ^offscreen_buffer, width: i32, height: i32) {
-	if (back_buffer.memory != nil) {win32.VirtualFree(back_buffer.memory, 0, win32.MEM_RELEASE)}
+	if (back_buffer.memory != nil) {delete(back_buffer.memory)}
 	back_buffer.width = width
 	back_buffer.height = height
 	bytes_per_pixel :: 4
@@ -142,16 +136,15 @@ win32_resize_DIB_section :: proc(back_buffer: ^offscreen_buffer, width: i32, hei
 	back_buffer.BitmapInfo.bmiHeader.biCompression = win32.BI_RGB
 
 	bitmap_memory_size := uint((back_buffer.width * back_buffer.height) * bytes_per_pixel)
-	back_buffer.memory =
-	transmute([^]u8)win32.VirtualAlloc(
-		nil,
-		bitmap_memory_size,
-		win32.MEM_RESERVE | win32.MEM_COMMIT,
-		win32.PAGE_READWRITE,
-	)
+	back_buffer.memory = make([]byte, bitmap_memory_size)
 }
 
-win32_display_buffer_in_window :: proc(back_buffer: ^offscreen_buffer, deviceContext: win32.HDC, destWidth: i32, destHeight: i32) {
+win32_display_buffer_in_window :: proc(
+	back_buffer: ^offscreen_buffer,
+	deviceContext: win32.HDC,
+	destWidth: i32,
+	destHeight: i32,
+) {
 	// TODO: aspect ratio correction
 	win32.StretchDIBits(
 		deviceContext,
@@ -163,7 +156,7 @@ win32_display_buffer_in_window :: proc(back_buffer: ^offscreen_buffer, deviceCon
 		0,
 		back_buffer.width,
 		back_buffer.height,
-		back_buffer.memory,
+		raw_data(back_buffer.memory),
 		&back_buffer.BitmapInfo,
 		win32.DIB_RGB_COLORS,
 		win32.SRCCOPY,
@@ -320,6 +313,7 @@ main :: proc() {
 	win32.UpdateWindow(windowHandle)
 
 	win32_resize_DIB_section(&GlobalBackBuffer, game.size.x, game.size.y)
+	defer delete(GlobalBackBuffer.memory)
 
 	// NOTE: since we specified CS_OWNDC, we can just get one device context and use it
 	// forever because we are not sharing it with anyone.
@@ -334,16 +328,19 @@ main :: proc() {
 		tone_hz = 261,
 		volume  = 10000,
 	}
-	sound_output.wave_period = f32(SAMPLE_RATE) / sound_output.tone_hz
+	sound_output.wave_period = cast(u32)(f32(SAMPLE_RATE) / f32(sound_output.tone_hz))
 	sound_output.latency_sample_count = SAMPLE_RATE / 20
 
-	dsound.load(windowHandle, &secondary_buffer, BUFFER_SIZE, SAMPLE_RATE)
-	win32_fill_sound_buffer(&sound_output, 0, sound_output.latency_sample_count * BYTES_PER_SAMPLE)
-	if hr := secondary_buffer->play(0, 0, dsound.DSBPLAY_LOOPING); hr < 0 {
+	dsound.load(windowHandle, &secondary_sound_buffer, BUFFER_SIZE, SAMPLE_RATE)
+	// no need to clear the secondary_sound_buffer in Odin, it's initialized to zero.
+	if hr := secondary_sound_buffer->play(0, 0, dsound.DSBPLAY_LOOPING); hr < 0 {
 		_, _, code := win32.DECODE_HRESULT(hr)
-		fmt.eprintf("Error in Play: code 0x%X\n", code)
-		return
+		show_error_and_panic(fmt.tprintf("Error in Play: code 0x%X\n", code))
 	}
+
+	// TODO: pool with bitmap make
+	samples := make([]i16, BUFFER_SIZE/2)  // BUFFER_SIZE is in bytes
+	defer delete(samples)
 
 	last_counter: win32.LARGE_INTEGER
 	last_cycle_count := x86._rdtsc()
@@ -391,32 +388,27 @@ main :: proc() {
 				xOffset += i32(stick_x / 4096)
 				yOffset -= i32(stick_y / 4096)
 
-				sound_output.tone_hz = math.clamp(512 + 32.0 * f32(stick_y / 2000.0), 100, 1566)
-				sound_output.wave_period = f32(SAMPLE_RATE) / sound_output.tone_hz
+				sound_output.tone_hz = cast(u32)math.clamp(512 + 32.0 * f32(stick_y / 2000.0), 120, 1566)
+				sound_output.wave_period = cast(u32)(f32(SAMPLE_RATE) / f32(sound_output.tone_hz))
 			}
 		}
 
 		// vibration: XINPUT_VIBRATION = {60000, 60000};
 		// XInputSetState(0, &vibration)
 
-		buffer := game_offscreen_buffer{
-			memory = GlobalBackBuffer.memory,
-			width = GlobalBackBuffer.width,
-			height = GlobalBackBuffer.height,
-			pitch = GlobalBackBuffer.pitch,
-		}
-		game_update_and_render(&buffer, xOffset, yOffset)
-
 		// DirectSound output test
-		play_cursor, write_cursor: u32
-		if hr := secondary_buffer->getCurrentPosition(&play_cursor, &write_cursor); hr < 0 {
+		bytes_to_lock, target_cursor, bytes_to_write, play_cursor, write_cursor: u32
+
+		// TODO: Tighten up sound logic so that we know where we should be
+		// writing to and can anticipate the time spent in the game update.
+		if hr := secondary_sound_buffer->getCurrentPosition(&play_cursor, &write_cursor); hr < 0 {
 			_, _, code := win32.DECODE_HRESULT(hr)
+			// NOTE: Casey doesn't panic, and has a "SoundIsValid" bool set to true if this succeeds. Weird?
 			show_error_and_panic(fmt.tprintf("Error in GetCurrentPosition: code 0x%X\n", code))
 		}
 
-		bytes_to_lock: u32 = (sound_output.running_sample_index * BYTES_PER_SAMPLE) % BUFFER_SIZE
-		target_cursor := (play_cursor + (sound_output.latency_sample_count * BYTES_PER_SAMPLE)) % BUFFER_SIZE
-		bytes_to_write: u32
+		bytes_to_lock = (sound_output.running_sample_index * BYTES_PER_SAMPLE) % BUFFER_SIZE
+		target_cursor = (play_cursor + (sound_output.latency_sample_count * BYTES_PER_SAMPLE)) % BUFFER_SIZE
 
 		if bytes_to_lock > target_cursor {
 			bytes_to_write = BUFFER_SIZE - bytes_to_lock // we have this much ahead of us in the buffer to write to
@@ -425,10 +417,21 @@ main :: proc() {
 			bytes_to_write = target_cursor - bytes_to_lock // we only have to fill from bytes_to_lock up to the play_cursor
 		}
 
-		win32_fill_sound_buffer(&sound_output, bytes_to_lock, bytes_to_write)
+		game_sound_buffer := Game_Sound_Buffer {
+			samples_per_second = SAMPLE_RATE,
+			sample_count       = bytes_to_write / BYTES_PER_SAMPLE,
+			samples            = samples, //raw_data(samples[:]),
+		}
+		buffer := Game_Offscreen_Buffer {
+			memory = GlobalBackBuffer.memory,
+			width  = GlobalBackBuffer.width,
+			height = GlobalBackBuffer.height,
+			pitch  = GlobalBackBuffer.pitch,
+		}
+		game_update_and_render(&buffer, &game_sound_buffer, xOffset, yOffset, sound_output.tone_hz)
+		win32_fill_sound_buffer(&sound_output, &game_sound_buffer, bytes_to_lock, bytes_to_write)
 
 		dims := get_window_dimensions(windowHandle)
-
 		win32_display_buffer_in_window(&GlobalBackBuffer, deviceContext, dims.width, dims.height)
 
 		// Frame timings
@@ -445,7 +448,9 @@ main :: proc() {
 		cycles_elapsed := end_cycle_count - last_cycle_count
 		mcpf := cycles_elapsed / (1000 * 1000)
 
-		win32.OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
+		when false {
+			win32.OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
+		}
 
 		last_counter = end_counter
 		last_cycle_count = end_cycle_count
