@@ -60,11 +60,8 @@ win32_window_dimensions :: struct {
 }
 
 win32_sound_output :: struct {
-	tone_hz:              u32, // TODO: f32?
-	volume:               u16,
 	running_sample_index: u32,
 	wave_period:          u32, // TODO: f32?
-	tSine:                f32,
 	latency_sample_count: u32,
 }
 
@@ -81,7 +78,9 @@ win32_fill_sound_buffer :: proc(
 	// [left right] [left right] [left right]
 	region1, region2: rawptr
 	size1, size2: u32
-	if win32.SUCCEEDED(secondary_sound_buffer->lock(byte_to_lock, bytes_to_write, &region1, &size1, &region2, &size2, 0)) {
+	if win32.SUCCEEDED(
+		secondary_sound_buffer->lock(byte_to_lock, bytes_to_write, &region1, &size1, &region2, &size2, 0),
+	) {
 		region1_sample_count := size1 / BYTES_PER_SAMPLE
 		dest_samples := transmute([^]i16)region1
 		src_samples := source_buffer.samples
@@ -291,6 +290,16 @@ create_window :: #force_inline proc(instance: win32.HINSTANCE, atom: win32.ATOM,
 	)
 }
 
+process_xinput_digital_button :: proc(
+	old_state: Game_Button_State,
+	new_state: ^Game_Button_State,
+	button_bit: xinput.XINPUT_GAMEPAD_BUTTON_BIT,
+	button_state: xinput.XINPUT_GAMEPAD_BUTTON,
+) {
+	new_state.ended_down = button_bit in button_state
+	new_state.half_transition_count = old_state.ended_down != new_state.ended_down
+}
+
 main :: proc() {
 	perf_counter_frequency: win32.LARGE_INTEGER
 	win32.QueryPerformanceFrequency(&perf_counter_frequency)
@@ -319,17 +328,8 @@ main :: proc() {
 	// forever because we are not sharing it with anyone.
 	deviceContext := win32.GetDC(windowHandle)
 
-	// NOTE: graphics test
-	xOffset: i32 = 0
-	yOffset: i32 = 0
-
 	// NOTE: sound test
-	sound_output := win32_sound_output {
-		tone_hz = 261,
-		volume  = 10000,
-	}
-	sound_output.wave_period = cast(u32)(f32(SAMPLE_RATE) / f32(sound_output.tone_hz))
-	sound_output.latency_sample_count = SAMPLE_RATE / 20
+	sound_output := win32_sound_output{latency_sample_count = SAMPLE_RATE / 15}
 
 	dsound.load(windowHandle, &secondary_sound_buffer, BUFFER_SIZE, SAMPLE_RATE)
 	// no need to clear the secondary_sound_buffer in Odin, it's initialized to zero.
@@ -338,8 +338,8 @@ main :: proc() {
 		show_error_and_panic(fmt.tprintf("Error in Play: code 0x%X\n", code))
 	}
 
-	// TODO: pool with bitmap make
-	samples := make([]i16, BUFFER_SIZE/2)  // BUFFER_SIZE is in bytes
+	// TODO: pool with bitmap make -- needed for odin? maybe not...
+	samples := make([]i16, BUFFER_SIZE / 2) // BUFFER_SIZE is in bytes, therefore
 	defer delete(samples)
 
 	last_counter: win32.LARGE_INTEGER
@@ -347,6 +347,9 @@ main :: proc() {
 	win32.QueryPerformanceCounter(&last_counter)
 
 	message: win32.MSG
+	new_input := &Game_Input{}
+	old_input := &Game_Input{}
+
 	for (global_running) {
 		if win32.PeekMessageA(&message, nil, 0, 0, win32.PM_REMOVE) {
 			if message.message == win32.WM_QUIT {global_running = false}
@@ -358,38 +361,74 @@ main :: proc() {
 
 		using xinput
 
+
 		// TODO: not sure about polling frequency yet.
 		packet_number: win32.DWORD
-		for user in XUSER {
+		for user, i in XUSER {
+			if i >= MAX_CONTROLLER_COUNT {
+				// skip unsupported controllers, for simplicity
+				continue
+			}
+
+			old_controller := &old_input.controllers[i]
+			new_controller := &new_input.controllers[i]
+
 			state: XINPUT_STATE
+
 			if result := XInputGetState(user, &state); result == .SUCCESS {
 				if packet_number == state.dwPacketNumber do continue
 
+				// TODO: dpad
 				pad := state.Gamepad
 				up := .DPAD_UP in pad.wButtons
 				down := .DPAD_DOWN in pad.wButtons
 				left := .DPAD_LEFT in pad.wButtons
 				right := .DPAD_RIGHT in pad.wButtons
-				start := .START in pad.wButtons
-				back := .BACK in pad.wButtons
-				left_shoulder := .LEFT_SHOULDER in pad.wButtons
-				right_shoulder := .RIGHT_SHOULDER in pad.wButtons
-				a_button := .A in pad.wButtons
-				b_button := .B in pad.wButtons
-				x_button := .X in pad.wButtons
-				y_button := .Y in pad.wButtons
 
-				stick_x := pad.sThumbLX
-				stick_y := pad.sThumbLY
-
-				// NOTE: we will do proper deadzone handling later:
+				// TODO: we will do proper deadzone handling later:
 				// XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
 				// XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
-				xOffset += i32(stick_x / 4096)
-				yOffset -= i32(stick_y / 4096)
 
-				sound_output.tone_hz = cast(u32)math.clamp(512 + 32.0 * f32(stick_y / 2000.0), 120, 1566)
-				sound_output.wave_period = cast(u32)(f32(SAMPLE_RATE) / f32(sound_output.tone_hz))
+				// TODO: min/max
+ 				x := (pad.sThumbLX < 0) ? f32(pad.sThumbLX) / f32(32768) : f32(pad.sThumbLX) / f32(32767)
+				y := (pad.sThumbLY < 0) ? f32(pad.sThumbLY) / f32(32768) : f32(pad.sThumbLY) / f32(32767)
+
+				new_controller.analog = true
+				new_controller.start_x = old_controller.end_x
+				new_controller.start_y = old_controller.end_y
+				new_controller.min_x = x
+				new_controller.max_x = x
+				new_controller.end_x = x
+				new_controller.min_y = y
+				new_controller.max_y = y
+				new_controller.end_y = y
+
+				process_xinput_digital_button(old_controller.a, &new_controller.a, .A, pad.wButtons)
+				process_xinput_digital_button(old_controller.b, &new_controller.b, .B, pad.wButtons)
+				process_xinput_digital_button(old_controller.x, &new_controller.x, .X, pad.wButtons)
+				process_xinput_digital_button(old_controller.y, &new_controller.y, .Y, pad.wButtons)
+				process_xinput_digital_button(
+					old_controller.left_shoulder,
+					&new_controller.left_shoulder,
+					.LEFT_SHOULDER,
+					pad.wButtons,
+				)
+				process_xinput_digital_button(
+					old_controller.right_shoulder,
+					&new_controller.right_shoulder,
+					.RIGHT_SHOULDER,
+					pad.wButtons,
+				)
+
+				start := .START in pad.wButtons
+				back := .BACK in pad.wButtons
+
+				// TODO: remove when we replace
+				//xOffset += i32(stick_x / 4096)
+				//yOffset -= i32(stick_y / 4096)
+
+				// sound_output.tone_hz = cast(u32)math.clamp(512 + 32.0 * f32(stick_y / 2000.0), 120, 1566)
+				// sound_output.wave_period = cast(u32)(f32(SAMPLE_RATE) / f32(sound_output.tone_hz))
 			}
 		}
 
@@ -428,7 +467,7 @@ main :: proc() {
 			height = GlobalBackBuffer.height,
 			pitch  = GlobalBackBuffer.pitch,
 		}
-		game_update_and_render(&buffer, &game_sound_buffer, xOffset, yOffset, sound_output.tone_hz)
+		game_update_and_render(new_input, &buffer, &game_sound_buffer)
 		win32_fill_sound_buffer(&sound_output, &game_sound_buffer, bytes_to_lock, bytes_to_write)
 
 		dims := get_window_dimensions(windowHandle)
@@ -455,6 +494,7 @@ main :: proc() {
 		last_counter = end_counter
 		last_cycle_count = end_cycle_count
 
+		new_input, old_input = old_input, new_input
 	}
 }
 
