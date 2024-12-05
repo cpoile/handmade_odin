@@ -42,13 +42,23 @@ SAMPLE_RATE: u32 : 44100
 BYTES_PER_SAMPLE :: size_of(i16) * 2
 BUFFER_SIZE :: SAMPLE_RATE * BYTES_PER_SAMPLE
 
-Game :: struct {
-	size: int2,
+Game_Memory :: struct {
+	permanent:     [^]u8, // NOTE: REQUIRED to be initialized to zero at startup. Windows does, make sure other platforms do.
+	permanent_len: uint,
+	temporary:     [^]u8,
+	temporary_len: uint,
+}
+
+Game_State :: struct {
+	initialized:  bool,
+	blue_offset:  i32,
+	green_offset: i32,
+	tone_hz:      u32,
 }
 
 offscreen_buffer :: struct {
 	BitmapInfo: win32.BITMAPINFO,
-	memory:     []byte,
+	memory:     []u8,
 	width:      i32,
 	height:     i32,
 	pitch:      i32,
@@ -269,11 +279,11 @@ adjust_size_for_style :: proc(size: ^int2, dwStyle: win32.DWORD) {
 	}
 }
 
-create_window :: #force_inline proc(instance: win32.HINSTANCE, atom: win32.ATOM, game: ^Game) -> win32.HWND {
+create_window :: #force_inline proc(instance: win32.HINSTANCE, atom: win32.ATOM, size: int2) -> win32.HWND {
+	size := size
 	if atom == 0 {show_error_and_panic("atom is zero")}
 	style :: win32.WS_OVERLAPPEDWINDOW
 	pos := int2{i32(win32.CW_USEDEFAULT), i32(win32.CW_USEDEFAULT)}
-	size := game.size
 	adjust_size_for_style(&size, style)
 	return win32.CreateWindowW(
 		win32.LPCWSTR(uintptr(atom)),
@@ -304,11 +314,8 @@ main :: proc() {
 	perf_counter_frequency: win32.LARGE_INTEGER
 	win32.QueryPerformanceFrequency(&perf_counter_frequency)
 
-	backtrace.register_segfault_handler()
 
-	game := Game {
-		size = {1280, 720},
-	}
+	backtrace.register_segfault_handler()
 
 	instance := win32.HINSTANCE(win32.GetModuleHandleW(nil))
 	if (instance == nil) {show_error_and_panic("No instance")}
@@ -316,12 +323,13 @@ main :: proc() {
 	if atom == 0 {show_error_and_panic("Failed to register window class")}
 	//defer unregister_class(atom, instance)  // TODO: crashing, not sure why.
 
-	windowHandle := create_window(instance, atom, &game)
+	size := int2{1280, 720}
+	windowHandle := create_window(instance, atom, size)
 	if windowHandle == nil {show_error_and_panic("Failed to create window")}
 	win32.ShowWindow(windowHandle, win32.SW_SHOWDEFAULT)
 	win32.UpdateWindow(windowHandle)
 
-	win32_resize_DIB_section(&GlobalBackBuffer, game.size.x, game.size.y)
+	win32_resize_DIB_section(&GlobalBackBuffer, size.x, size.y)
 	defer delete(GlobalBackBuffer.memory)
 
 	// NOTE: since we specified CS_OWNDC, we can just get one device context and use it
@@ -329,7 +337,9 @@ main :: proc() {
 	deviceContext := win32.GetDC(windowHandle)
 
 	// NOTE: sound test
-	sound_output := win32_sound_output{latency_sample_count = SAMPLE_RATE / 15}
+	sound_output := win32_sound_output {
+		latency_sample_count = SAMPLE_RATE / 15,
+	}
 
 	dsound.load(windowHandle, &secondary_sound_buffer, BUFFER_SIZE, SAMPLE_RATE)
 	// no need to clear the secondary_sound_buffer in Odin, it's initialized to zero.
@@ -341,6 +351,32 @@ main :: proc() {
 	// TODO: pool with bitmap make -- needed for odin? maybe not...
 	samples := make([]i16, BUFFER_SIZE / 2) // BUFFER_SIZE is in bytes, therefore
 	defer delete(samples)
+
+	// NOTE: Casey uses VirtualAlloc, so I'm going to do the same (for now). We're simulating our own allocator, so why not go raw.
+
+	when HANDMADE_INTERNAL {
+		base_address : win32.LPVOID = transmute(rawptr)TERABYTES(2)  // in windows 64-bit, first 8 terabytes are reserved for the application
+	} else {
+		base_address : win32.LPVOID = nil
+	}
+	game_memory := Game_Memory{}
+	game_memory.permanent_len = MEGABYTES(64)
+	game_memory.temporary_len = GIGABYTES(4)
+
+	// TODO: Handle various memory footprints.
+	total_size := game_memory.permanent_len + game_memory.temporary_len
+	game_memory.permanent =
+	transmute([^]u8)win32.VirtualAlloc(
+		base_address,
+		total_size,
+		win32.MEM_RESERVE | win32.MEM_COMMIT,
+		win32.PAGE_READWRITE,
+	)
+	game_memory.temporary = game_memory.permanent[game_memory.permanent_len:]
+
+	if (game_memory.permanent == nil || game_memory.temporary == nil) {
+		show_error_and_panic(fmt.tprint("Could not allocate memory for game, exiting!"))
+	}
 
 	last_counter: win32.LARGE_INTEGER
 	last_cycle_count := x86._rdtsc()
@@ -390,7 +426,7 @@ main :: proc() {
 				// XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
 
 				// TODO: min/max
- 				x := (pad.sThumbLX < 0) ? f32(pad.sThumbLX) / f32(32768) : f32(pad.sThumbLX) / f32(32767)
+				x := (pad.sThumbLX < 0) ? f32(pad.sThumbLX) / f32(32768) : f32(pad.sThumbLX) / f32(32767)
 				y := (pad.sThumbLY < 0) ? f32(pad.sThumbLY) / f32(32768) : f32(pad.sThumbLY) / f32(32767)
 
 				new_controller.analog = true
@@ -462,12 +498,12 @@ main :: proc() {
 			samples            = samples, //raw_data(samples[:]),
 		}
 		buffer := Game_Offscreen_Buffer {
-			memory = GlobalBackBuffer.memory,
+			memory = transmute([^]u8)raw_data(GlobalBackBuffer.memory),
 			width  = GlobalBackBuffer.width,
 			height = GlobalBackBuffer.height,
 			pitch  = GlobalBackBuffer.pitch,
 		}
-		game_update_and_render(new_input, &buffer, &game_sound_buffer)
+		game_update_and_render(&game_memory, new_input, &buffer, &game_sound_buffer)
 		win32_fill_sound_buffer(&sound_output, &game_sound_buffer, bytes_to_lock, bytes_to_write)
 
 		dims := get_window_dimensions(windowHandle)
