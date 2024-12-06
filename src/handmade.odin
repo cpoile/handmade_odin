@@ -110,10 +110,10 @@ game_update_and_render :: proc(
 	sound_buffer: ^Game_Sound_Buffer,
 ) {
 	when ODIN_DEBUG {
-		assert(size_of(Game_State) <= game_memory.permanent_len)
+		assert(size_of(Game_State) <= len(game_memory.permanent))
 	}
 
-	state := (^Game_State)(game_memory.permanent)
+	state := (^Game_State)(raw_data(game_memory.permanent))
 	if !state.initialized {
 		state.tone_hz = 256
 		state.initialized = true

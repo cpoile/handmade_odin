@@ -29,6 +29,7 @@ import "core:dynlib"
 import "core:fmt"
 import "core:log"
 import "core:math"
+import "core:mem"
 import "core:simd/x86"
 import "core:strings"
 import win32 "core:sys/windows"
@@ -43,10 +44,8 @@ BYTES_PER_SAMPLE :: size_of(i16) * 2
 BUFFER_SIZE :: SAMPLE_RATE * BYTES_PER_SAMPLE
 
 Game_Memory :: struct {
-	permanent:     [^]u8, // NOTE: REQUIRED to be initialized to zero at startup. Windows does, make sure other platforms do.
-	permanent_len: uint,
-	temporary:     [^]u8,
-	temporary_len: uint,
+	permanent:     []u8, // NOTE: REQUIRED to be initialized to zero at startup. Windows does, make sure other platforms do.
+	temporary:     []u8,
 }
 
 Game_State :: struct {
@@ -360,23 +359,21 @@ main :: proc() {
 		base_address : win32.LPVOID = nil
 	}
 	game_memory := Game_Memory{}
-	game_memory.permanent_len = MEGABYTES(64)
-	game_memory.temporary_len = GIGABYTES(4)
+	permanent_len := MEGABYTES(64)
+	temporary_len := GIGABYTES(4)
 
 	// TODO: Handle various memory footprints.
-	total_size := game_memory.permanent_len + game_memory.temporary_len
-	game_memory.permanent =
-	transmute([^]u8)win32.VirtualAlloc(
+	raw_mem := win32.VirtualAlloc(
 		base_address,
-		total_size,
+		permanent_len + temporary_len,
 		win32.MEM_RESERVE | win32.MEM_COMMIT,
 		win32.PAGE_READWRITE,
 	)
-	game_memory.temporary = game_memory.permanent[game_memory.permanent_len:]
-
-	if (game_memory.permanent == nil || game_memory.temporary == nil) {
+	if raw_mem == nil {
 		show_error_and_panic(fmt.tprint("Could not allocate memory for game, exiting!"))
 	}
+	game_memory.permanent = mem.byte_slice(raw_mem, permanent_len)
+	game_memory.temporary = mem.byte_slice(cast(rawptr)(uintptr(raw_mem) + uintptr(permanent_len)), temporary_len)
 
 	last_counter: win32.LARGE_INTEGER
 	last_cycle_count := x86._rdtsc()
@@ -394,9 +391,7 @@ main :: proc() {
 			win32.DispatchMessageW(&message)
 		}
 
-
 		using xinput
-
 
 		// TODO: not sure about polling frequency yet.
 		packet_number: win32.DWORD
@@ -426,7 +421,7 @@ main :: proc() {
 				// XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
 
 				// TODO: min/max
-				x := (pad.sThumbLX < 0) ? f32(pad.sThumbLX) / f32(32768) : f32(pad.sThumbLX) / f32(32767)
+				x := (pad.sThumbLX < 0.0) ? f32(pad.sThumbLX) / f32(32768) : f32(pad.sThumbLX) / f32(32767)
 				y := (pad.sThumbLY < 0) ? f32(pad.sThumbLY) / f32(32768) : f32(pad.sThumbLY) / f32(32767)
 
 				new_controller.analog = true
