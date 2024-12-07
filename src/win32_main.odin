@@ -67,7 +67,7 @@ win32_window_dimensions :: struct {
 
 win32_sound_output :: struct {
 	running_sample_index: u32,
-	wave_period:          u32, // TODO: f32?
+	wave_period:          u32,
 	latency_sample_count: u32,
 }
 
@@ -338,6 +338,7 @@ win32_process_xinput_digital_button :: proc(
 }
 
 win32_process_keyboard_message :: proc(new_state: ^Game_Button_State, isDown: bool) {
+	assert(new_state.ended_down != isDown) // should only get this when isDown changes
 	new_state.ended_down = isDown
 	new_state.half_transition_count += 1
 }
@@ -361,21 +362,21 @@ win32_process_messages :: proc(keyboard_controller: ^Game_Controller_Input) {
 				case VK_F4:
 					if altDown {global_running = false}
 				case 'W':
-					win32_process_keyboard_message(&keyboard_controller.up, isDown)
+					win32_process_keyboard_message(&keyboard_controller.move_up, isDown)
 				case 'R':
-					win32_process_keyboard_message(&keyboard_controller.down, isDown)
+					win32_process_keyboard_message(&keyboard_controller.move_down, isDown)
 				case 'A':
-					win32_process_keyboard_message(&keyboard_controller.left, isDown)
+					win32_process_keyboard_message(&keyboard_controller.move_left, isDown)
 				case 'S':
-					win32_process_keyboard_message(&keyboard_controller.right, isDown)
+					win32_process_keyboard_message(&keyboard_controller.move_right, isDown)
 				case VK_UP:
-					win32_process_keyboard_message(&keyboard_controller.up, isDown)
+					win32_process_keyboard_message(&keyboard_controller.action_up, isDown)
 				case VK_DOWN:
-					win32_process_keyboard_message(&keyboard_controller.down, isDown)
+					win32_process_keyboard_message(&keyboard_controller.action_down, isDown)
 				case VK_LEFT:
-					win32_process_keyboard_message(&keyboard_controller.left, isDown)
+					win32_process_keyboard_message(&keyboard_controller.action_left, isDown)
 				case VK_RIGHT:
-					win32_process_keyboard_message(&keyboard_controller.right, isDown)
+					win32_process_keyboard_message(&keyboard_controller.action_right, isDown)
 				case 'Q':
 					win32_process_keyboard_message(&keyboard_controller.left_shoulder, isDown)
 				case 'F':
@@ -468,12 +469,16 @@ main :: proc() {
 		using xinput
 
 		// zero the keyboard at the start of each frame
-		// TODO: we can't zero everything because the up/down state will be wrong (we can't hold down the key)
-		keyboard_controller := &new_input.controllers[0]
-		keyboard_controller^ = {}
+		old_keyboard_controller := &old_input.controllers[0]
+		new_keyboard_controller := &new_input.controllers[0]
+		new_keyboard_controller^ = {isConnected = true}
+		for i in 0 ..< 10 {
+			new_keyboard_controller.buttons[i].ended_down = old_keyboard_controller.buttons[i].ended_down
+		}
 
-		win32_process_messages(keyboard_controller)
+		win32_process_messages(new_keyboard_controller)
 
+		// TODO: Need to not poll disconnected controllers to avoid xinput frame rate hit on older libraries
 		// TODO: not sure about polling frequency yet.
 		packet_number: DWORD
 		for user, i in XUSER {
@@ -482,37 +487,55 @@ main :: proc() {
 				continue
 			}
 
-			old_controller := &old_input.controllers[i]
-			new_controller := &new_input.controllers[i]
+			controller_idx := i + 1
+			old_controller := &old_input.controllers[controller_idx]
+			new_controller := &new_input.controllers[controller_idx]
 
 			state: XINPUT_STATE
 			if result := XInputGetState(user, &state); result == .SUCCESS {
 				if packet_number == state.dwPacketNumber do continue
-				// TODO: dpad
+				new_controller.isConnected = true
 				pad := state.Gamepad
-				// up := .DPAD_UP in pad.wButtons
-				// down := .DPAD_DOWN in pad.wButtons
-				// left := .DPAD_LEFT in pad.wButtons
-				// right := .DPAD_RIGHT in pad.wButtons
 
-				// TODO: we will do proper deadzone handling later:
-				// XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
-				// XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
-
-				// TODO: min/max
-				x := (pad.sThumbLX < 0.0) ? f32(pad.sThumbLX) / f32(32768) : f32(pad.sThumbLX) / f32(32767)
-				y := (pad.sThumbLY < 0) ? f32(pad.sThumbLY) / f32(32768) : f32(pad.sThumbLY) / f32(32767)
+				// TODO: this is a square deadzone, check XINPUT to verify if the deadzone is round
+				dzone := XINPUT_GAMEPAD_LEFT_THUMB_DEADZONE
+				x := (pad.sThumbLX < dzone) ? f32(pad.sThumbLX) / f32(32768) : f32(pad.sThumbLX) / f32(32767)
+				y := (pad.sThumbLY < -dzone) ? f32(pad.sThumbLY) / f32(32768) : f32(pad.sThumbLY) / f32(32767)
 
 				new_controller.analog = true
-				new_controller.start_x = old_controller.end_x
-				new_controller.start_y = old_controller.end_y
-				new_controller.min_x = x
-				new_controller.max_x = x
-				new_controller.end_x = x
-				new_controller.min_y = y
-				new_controller.max_y = y
-				new_controller.end_y = y
+				new_controller.stick_avg_x = x
+				new_controller.stick_avg_y = y
+				if .DPAD_UP in pad.wButtons {new_controller.stick_avg_y = 1}
+				if .DPAD_DOWN in pad.wButtons {new_controller.stick_avg_y = -1}
+				if .DPAD_LEFT in pad.wButtons {new_controller.stick_avg_x = -1}
+				if .DPAD_RIGHT in pad.wButtons {new_controller.stick_avg_x = 1}
 
+				// NOTE: not doing the stick->move_up/down/etc mapping that Casey did. Maybe I'll do it if we need it later.
+
+				win32_process_xinput_digital_button(
+					old_controller.move_up,
+					&new_controller.move_up,
+					.DPAD_UP,
+					pad.wButtons,
+				)
+				win32_process_xinput_digital_button(
+					old_controller.move_down,
+					&new_controller.move_down,
+					.DPAD_DOWN,
+					pad.wButtons,
+				)
+				win32_process_xinput_digital_button(
+					old_controller.move_left,
+					&new_controller.move_left,
+					.DPAD_LEFT,
+					pad.wButtons,
+				)
+				win32_process_xinput_digital_button(
+					old_controller.move_right,
+					&new_controller.move_right,
+					.DPAD_RIGHT,
+					pad.wButtons,
+				)
 				win32_process_xinput_digital_button(old_controller.a, &new_controller.a, .A, pad.wButtons)
 				win32_process_xinput_digital_button(old_controller.b, &new_controller.b, .B, pad.wButtons)
 				win32_process_xinput_digital_button(old_controller.x, &new_controller.x, .X, pad.wButtons)
@@ -529,16 +552,10 @@ main :: proc() {
 					.RIGHT_SHOULDER,
 					pad.wButtons,
 				)
-
-				// start := .START in pad.wButtons
-				// back := .BACK in pad.wButtons
-
-				// TODO: remove when we replace
-				//xOffset += i32(stick_x / 4096)
-				//yOffset -= i32(stick_y / 4096)
-
-				// sound_output.tone_hz = cast(u32)math.clamp(512 + 32.0 * f32(stick_y / 2000.0), 120, 1566)
-				// sound_output.wave_period = cast(u32)(f32(SAMPLE_RATE) / f32(sound_output.tone_hz))
+				win32_process_xinput_digital_button(old_controller.back, &new_controller.back, .BACK, pad.wButtons)
+				win32_process_xinput_digital_button(old_controller.start, &new_controller.start, .START, pad.wButtons)
+			} else {
+				new_controller.isConnected = false
 			}
 		}
 

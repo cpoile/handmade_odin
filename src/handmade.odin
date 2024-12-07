@@ -19,6 +19,7 @@ TERABYTES :: #force_inline proc($V: uint) -> uint {return V * mem.Terabyte}
 
 // for now
 MAX_CONTROLLER_COUNT :: 4
+MAX_INPUTS :: MAX_CONTROLLER_COUNT + 1 // for keyboard
 
 // TODO: In the future, rendering _specifically_ will become a three-tiered abstraction!!
 Game_Offscreen_Buffer :: struct {
@@ -78,31 +79,39 @@ Game_Button_State :: struct {
 }
 
 Game_Controller_Input :: struct {
-	analog:         bool,
-	start_x:        f32,
-	start_y:        f32,
-	min_x:          f32,
-	min_y:          f32,
-	max_x:          f32,
-	max_y:          f32,
-	end_x:          f32,
-	end_y:          f32,
-	up:             Game_Button_State,
-	down:           Game_Button_State,
-	left:           Game_Button_State,
-	right:          Game_Button_State,
-	a:              Game_Button_State,
-	b:              Game_Button_State,
-	x:              Game_Button_State,
-	y:              Game_Button_State,
-	left_shoulder:  Game_Button_State,
-	right_shoulder: Game_Button_State,
+	isConnected: bool,
+	analog:      bool,
+	stick_avg_x: f32,
+	stick_avg_y: f32,
+	using _:     struct #raw_union {
+		buttons: [16]Game_Button_State,
+		using _: struct {
+			move_up:        Game_Button_State,
+			move_down:      Game_Button_State,
+			move_left:      Game_Button_State,
+			move_right:     Game_Button_State,
+			action_up:      Game_Button_State,
+			action_down:    Game_Button_State,
+			action_left:    Game_Button_State,
+			action_right:   Game_Button_State,
+			left_shoulder:  Game_Button_State,
+			right_shoulder: Game_Button_State,
+			a:              Game_Button_State,
+			b:              Game_Button_State,
+			x:              Game_Button_State,
+			y:              Game_Button_State,
+			back:           Game_Button_State,
+			start:          Game_Button_State,
+			// NOTE: always add new buttons above the terminator.
+			terminator:     Game_Button_State,
+		},
+	},
 }
 
 Game_Input :: struct {
 	// TODO: insert clock value here.
 	//? seconds_elapsed: f32,
-	controllers: [4]Game_Controller_Input,
+	controllers: [MAX_INPUTS]Game_Controller_Input,
 }
 
 // NOTE: may expand in the future
@@ -115,6 +124,10 @@ game_update_and_render :: proc(
 ) -> bool {
 	when ODIN_DEBUG {
 		assert(size_of(Game_State) <= len(game_memory.permanent))
+		assert(
+			(cast(uintptr)&input.controllers[0].terminator - cast(uintptr)&input.controllers[0].move_up) ==
+			len(input.controllers[0].buttons) * size_of(Game_Button_State),
+		)
 	}
 
 	state := (^Game_State)(raw_data(game_memory.permanent))
@@ -130,19 +143,21 @@ game_update_and_render :: proc(
 		state.initialized = true
 	}
 
-	input_0 := input.controllers[0]
+	for i in 0 ..< MAX_INPUTS {
+		input := input.controllers[i]
 
-	if input_0.analog {
-		// NOTE: Use analog movement tuning
-		state.tone_hz = cast(u32)math.clamp(261 + 64.0 * input_0.end_y, 120, 1566)
-		state.blue_offset += i32(input_0.end_x * 4)
-		state.green_offset -= i32(input_0.end_y * 4)
+		if input.analog {
+			// NOTE: Use analog movement tuning
+			state.tone_hz = cast(u32)math.clamp(261 + 64.0 * input.stick_avg_y, 120, 1566)
+			state.blue_offset += i32(input.stick_avg_x * 4)
+			state.green_offset -= i32(input.stick_avg_y * 4)
+		}
+
+		state.blue_offset += i32(input.move_right.ended_down ? 1 : 0 * 4)
+		state.blue_offset -= i32(input.move_left.ended_down ? 1 : 0 * 4)
+		state.green_offset -= i32(input.move_up.ended_down ? 1 : 0 * 4)
+		state.green_offset += i32(input.move_down.ended_down ? 1 : 0 * 4)
 	}
-	// TODO: what to do about this analog thing?
-	state.blue_offset += i32(input_0.right.half_transition_count * 4)
-	state.blue_offset -= i32(input_0.left.half_transition_count * 4)
-	state.green_offset -= i32(input_0.up.half_transition_count * 4)
-	state.green_offset += i32(input_0.down.half_transition_count * 4)
 
 	// TODO: Allow sample offsets here (eg, set sound further out in the future, or closer to immediately)
 	game_sound_output(sound_buffer, state.tone_hz)
