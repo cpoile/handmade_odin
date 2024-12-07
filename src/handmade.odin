@@ -41,7 +41,7 @@ game_sound_output :: proc(sound_buffer: ^Game_Sound_Buffer, tone_hz: u32) {
 	wave_period := sound_buffer.samples_per_second / tone_hz
 
 	sample_out := sound_buffer.samples
-	for i in 0 ..< sound_buffer.sample_count {
+	for _ in 0 ..< sound_buffer.sample_count {
 		sine_val := math.sin_f32(t_sine)
 		sample_value := i16(sine_val * f32(tone_volume))
 		sample_out[0] = sample_value
@@ -57,7 +57,7 @@ game_sound_output :: proc(sound_buffer: ^Game_Sound_Buffer, tone_hz: u32) {
 render_weird_gradient :: proc(back_buffer: ^Game_Offscreen_Buffer, blue_offset: i32, yOffset: i32) {
 	row := back_buffer.memory
 	for y in 0 ..< back_buffer.height {
-		pixel := transmute([^]u32)row
+		pixel := cast([^]u32)row
 		for x in 0 ..< back_buffer.width {
 			//                   1  2  3  4
 			// pixel in memory: BB GG RR xx  (bc MSFT wanted to see RGB in register (see register)
@@ -87,6 +87,10 @@ Game_Controller_Input :: struct {
 	max_y:          f32,
 	end_x:          f32,
 	end_y:          f32,
+	up:             Game_Button_State,
+	down:           Game_Button_State,
+	left:           Game_Button_State,
+	right:          Game_Button_State,
 	a:              Game_Button_State,
 	b:              Game_Button_State,
 	x:              Game_Button_State,
@@ -133,9 +137,12 @@ game_update_and_render :: proc(
 		state.tone_hz = cast(u32)math.clamp(261 + 64.0 * input_0.end_y, 120, 1566)
 		state.blue_offset += i32(input_0.end_x * 4)
 		state.green_offset -= i32(input_0.end_y * 4)
-	} else {
-		// NOTE: Use digital movement tuning
 	}
+	// TODO: what to do about this analog thing?
+	state.blue_offset += i32(input_0.right.half_transition_count * 4)
+	state.blue_offset -= i32(input_0.left.half_transition_count * 4)
+	state.green_offset -= i32(input_0.up.half_transition_count * 4)
+	state.green_offset += i32(input_0.down.half_transition_count * 4)
 
 	// TODO: Allow sample offsets here (eg, set sound further out in the future, or closer to immediately)
 	game_sound_output(sound_buffer, state.tone_hz)

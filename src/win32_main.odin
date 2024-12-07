@@ -25,13 +25,9 @@ import "../vendor/dsound"
 import "../vendor/odin-xinput/xinput"
 import "base:intrinsics"
 import "base:runtime"
-import "core:dynlib"
 import "core:fmt"
-import "core:log"
-import "core:math"
 import bits "core:math/bits"
 import "core:mem"
-import "core:simd/x86"
 import "core:strings"
 import win32 "core:sys/windows"
 
@@ -101,7 +97,7 @@ DEBUG_platform_read_entire_file :: proc(filename: string) -> (memory: []u8, ok: 
 
 	size: win32.LARGE_INTEGER
 	win32.GetFileSizeEx(fh, &size) or_return
-	
+
 	assert(size < bits.U32_MAX)
 
 	raw_mem := win32.VirtualAlloc(nil, uint(size), win32.MEM_RESERVE | win32.MEM_COMMIT, win32.PAGE_READWRITE)
@@ -156,9 +152,9 @@ win32_fill_sound_buffer :: proc(
 		secondary_sound_buffer->lock(byte_to_lock, bytes_to_write, &region1, &size1, &region2, &size2, 0),
 	) {
 		region1_sample_count := size1 / BYTES_PER_SAMPLE
-		dest_samples := transmute([^]i16)region1
+		dest_samples := cast([^]i16)region1
 		src_samples := source_buffer.samples
-		for i in 0 ..< region1_sample_count {
+		for _ in 0 ..< region1_sample_count {
 			dest_samples[0] = src_samples[0]
 			dest_samples = dest_samples[1:]
 			src_samples = src_samples[1:]
@@ -169,9 +165,9 @@ win32_fill_sound_buffer :: proc(
 			sound_output.running_sample_index += 1
 		}
 
-		dest_samples = transmute([^]i16)region2
+		dest_samples = cast([^]i16)region2
 		region2_sample_count := size2 / BYTES_PER_SAMPLE
-		for i in 0 ..< region2_sample_count {
+		for _ in 0 ..< region2_sample_count {
 			dest_samples[0] = src_samples[0]
 			dest_samples = dest_samples[1:]
 			src_samples = src_samples[1:]
@@ -245,8 +241,6 @@ win32_main_window_callback :: proc "system" (
 	using win32
 	context = runtime.default_context()
 
-	alt_is_down := false
-
 	result: LRESULT
 	switch message {
 	case WM_CREATE:
@@ -260,38 +254,7 @@ win32_main_window_callback :: proc "system" (
 		OutputDebugStringA("WM_DESTROY\n")
 
 	case WM_SYSKEYDOWN, WM_SYSKEYUP, WM_KEYDOWN, WM_KEYUP:
-		vk_code := WParam
-		altDown := (LParam & (1 << 29)) != 0
-		wasDown := (LParam & (1 << 30)) != 0
-		isDown := (LParam & (1 << 31)) == 0
-		if (isDown != wasDown) {
-			switch vk_code {
-			case VK_F4:
-				if altDown {global_running = false}
-			case 'W':
-				OutputDebugStringA("W\n")
-			case 'A':
-				OutputDebugStringA("A\n")
-			case 'R':
-				OutputDebugStringA("R\n")
-			case 'S':
-				OutputDebugStringA("S\n")
-			case 'Q':
-				OutputDebugStringA("Q\n")
-			case 'F':
-				OutputDebugStringA("F\n")
-			case VK_UP:
-				OutputDebugStringA("up\n")
-			case VK_DOWN:
-				OutputDebugStringA("down\n")
-			case VK_LEFT:
-				OutputDebugStringA("left\n")
-			case VK_RIGHT:
-				OutputDebugStringA("Right\n")
-			case VK_ESCAPE:
-				OutputDebugStringA(fmt.ctprintf("Escape is down? %t was down? %t\n", isDown, wasDown))
-			}
-		}
+		assert(false, "Keyboard input came in througha  non-dispatch message!")
 
 	case WM_CLOSE:
 		global_running = false
@@ -364,7 +327,7 @@ create_window :: #force_inline proc(instance: win32.HINSTANCE, atom: win32.ATOM,
 	)
 }
 
-process_xinput_digital_button :: proc(
+win32_process_xinput_digital_button :: proc(
 	old_state: Game_Button_State,
 	new_state: ^Game_Button_State,
 	button_bit: xinput.XINPUT_GAMEPAD_BUTTON_BIT,
@@ -374,14 +337,70 @@ process_xinput_digital_button :: proc(
 	new_state.half_transition_count = old_state.ended_down != new_state.ended_down
 }
 
+win32_process_keyboard_message :: proc(new_state: ^Game_Button_State, isDown: bool) {
+	new_state.ended_down = isDown
+	new_state.half_transition_count += 1
+}
+
+win32_process_messages :: proc(keyboard_controller: ^Game_Controller_Input) {
+	using win32
+
+	message: MSG
+	for PeekMessageA(&message, nil, 0, 0, PM_REMOVE) {
+		switch message.message {
+		case WM_QUIT:
+			global_running = false
+		case WM_SYSKEYDOWN, WM_SYSKEYUP, WM_KEYDOWN, WM_KEYUP:
+			vk_code := message.wParam
+			lParam := message.lParam
+			altDown := (lParam & (1 << 29)) != 0
+			wasDown := (lParam & (1 << 30)) != 0
+			isDown := (lParam & (1 << 31)) == 0
+			if (isDown != wasDown) {
+				switch vk_code {
+				case VK_F4:
+					if altDown {global_running = false}
+				case 'W':
+					win32_process_keyboard_message(&keyboard_controller.up, isDown)
+				case 'R':
+					win32_process_keyboard_message(&keyboard_controller.down, isDown)
+				case 'A':
+					win32_process_keyboard_message(&keyboard_controller.left, isDown)
+				case 'S':
+					win32_process_keyboard_message(&keyboard_controller.right, isDown)
+				case VK_UP:
+					win32_process_keyboard_message(&keyboard_controller.up, isDown)
+				case VK_DOWN:
+					win32_process_keyboard_message(&keyboard_controller.down, isDown)
+				case VK_LEFT:
+					win32_process_keyboard_message(&keyboard_controller.left, isDown)
+				case VK_RIGHT:
+					win32_process_keyboard_message(&keyboard_controller.right, isDown)
+				case 'Q':
+					win32_process_keyboard_message(&keyboard_controller.left_shoulder, isDown)
+				case 'F':
+					win32_process_keyboard_message(&keyboard_controller.right_shoulder, isDown)
+				case VK_ESCAPE:
+					global_running = false
+				}
+			}
+		case:
+			TranslateMessage(&message)
+			DispatchMessageW(&message)
+		}
+	}
+}
+
 main :: proc() {
-	perf_counter_frequency: win32.LARGE_INTEGER
-	win32.QueryPerformanceFrequency(&perf_counter_frequency)
+	using win32
+
+	perf_counter_frequency: LARGE_INTEGER
+	QueryPerformanceFrequency(&perf_counter_frequency)
 
 
 	backtrace.register_segfault_handler()
 
-	instance := win32.HINSTANCE(win32.GetModuleHandleW(nil))
+	instance := HINSTANCE(GetModuleHandleW(nil))
 	if (instance == nil) {show_error_and_panic("No instance")}
 	atom := register_class(instance)
 	if atom == 0 {show_error_and_panic("Failed to register window class")}
@@ -390,15 +409,15 @@ main :: proc() {
 	size := int2{1280, 720}
 	windowHandle := create_window(instance, atom, size)
 	if windowHandle == nil {show_error_and_panic("Failed to create window")}
-	win32.ShowWindow(windowHandle, win32.SW_SHOWDEFAULT)
-	win32.UpdateWindow(windowHandle)
+	ShowWindow(windowHandle, SW_SHOWDEFAULT)
+	UpdateWindow(windowHandle)
 
 	win32_resize_DIB_section(&GlobalBackBuffer, size.x, size.y)
 	defer delete(GlobalBackBuffer.memory)
 
 	// NOTE: since we specified CS_OWNDC, we can just get one device context and use it
 	// forever because we are not sharing it with anyone.
-	deviceContext := win32.GetDC(windowHandle)
+	deviceContext := GetDC(windowHandle)
 
 	// NOTE: sound test
 	sound_output := win32_sound_output {
@@ -408,7 +427,7 @@ main :: proc() {
 	dsound.load(windowHandle, &secondary_sound_buffer, BUFFER_SIZE, SAMPLE_RATE)
 	// no need to clear the secondary_sound_buffer in Odin, it's initialized to zero.
 	if hr := secondary_sound_buffer->play(0, 0, dsound.DSBPLAY_LOOPING); hr < 0 {
-		_, _, code := win32.DECODE_HRESULT(hr)
+		_, _, code := DECODE_HRESULT(hr)
 		show_error_and_panic(fmt.tprintf("Error in Play: code 0x%X\n", code))
 	}
 
@@ -419,47 +438,44 @@ main :: proc() {
 	// NOTE: Casey uses VirtualAlloc, so I'm going to do the same (for now). We're simulating our own allocator, so why not go raw.
 
 	when HANDMADE_INTERNAL {
-		base_address: win32.LPVOID = transmute(rawptr)TERABYTES(2) // in windows 64-bit, first 8 terabytes are reserved for the application
+		base_address: LPVOID = transmute(rawptr)TERABYTES(2) // in windows 64-bit, first 8 terabytes are reserved for the application
 	} else {
-		base_address: win32.LPVOID = nil
+		base_address: LPVOID = nil
 	}
 	game_memory := Game_Memory{}
 	permanent_len := MEGABYTES(64)
 	temporary_len := GIGABYTES(4)
 
 	// TODO: Handle various memory footprints.
-	raw_mem := win32.VirtualAlloc(
-		base_address,
-		permanent_len + temporary_len,
-		win32.MEM_RESERVE | win32.MEM_COMMIT,
-		win32.PAGE_READWRITE,
-	)
+	raw_mem := VirtualAlloc(base_address, permanent_len + temporary_len, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE)
 	if raw_mem == nil {
 		show_error_and_panic(fmt.tprint("Could not allocate memory for game, exiting!"))
 	}
 	game_memory.permanent = mem.byte_slice(raw_mem, permanent_len)
 	game_memory.temporary = mem.byte_slice(cast(rawptr)(uintptr(raw_mem) + uintptr(permanent_len)), temporary_len)
 
-	last_counter: win32.LARGE_INTEGER
-	last_cycle_count := x86._rdtsc()
-	win32.QueryPerformanceCounter(&last_counter)
+	// Frame timings
+	when false {
+		last_counter: LARGE_INTEGER
+		last_cycle_count := x86._rdtsc()
+		QueryPerformanceCounter(&last_counter)
+	}
 
-	message: win32.MSG
 	new_input := &Game_Input{}
 	old_input := &Game_Input{}
 
 	for (global_running) {
-		if win32.PeekMessageA(&message, nil, 0, 0, win32.PM_REMOVE) {
-			if message.message == win32.WM_QUIT {global_running = false}
-
-			win32.TranslateMessage(&message)
-			win32.DispatchMessageW(&message)
-		}
-
 		using xinput
 
+		// zero the keyboard at the start of each frame
+		// TODO: we can't zero everything because the up/down state will be wrong (we can't hold down the key)
+		keyboard_controller := &new_input.controllers[0]
+		keyboard_controller^ = {}
+
+		win32_process_messages(keyboard_controller)
+
 		// TODO: not sure about polling frequency yet.
-		packet_number: win32.DWORD
+		packet_number: DWORD
 		for user, i in XUSER {
 			if i >= MAX_CONTROLLER_COUNT {
 				// skip unsupported controllers, for simplicity
@@ -470,16 +486,14 @@ main :: proc() {
 			new_controller := &new_input.controllers[i]
 
 			state: XINPUT_STATE
-
 			if result := XInputGetState(user, &state); result == .SUCCESS {
 				if packet_number == state.dwPacketNumber do continue
-
 				// TODO: dpad
 				pad := state.Gamepad
-				up := .DPAD_UP in pad.wButtons
-				down := .DPAD_DOWN in pad.wButtons
-				left := .DPAD_LEFT in pad.wButtons
-				right := .DPAD_RIGHT in pad.wButtons
+				// up := .DPAD_UP in pad.wButtons
+				// down := .DPAD_DOWN in pad.wButtons
+				// left := .DPAD_LEFT in pad.wButtons
+				// right := .DPAD_RIGHT in pad.wButtons
 
 				// TODO: we will do proper deadzone handling later:
 				// XINPUT_GAMEPAD_RIGHT_THUMB_DEADZONE
@@ -499,25 +513,25 @@ main :: proc() {
 				new_controller.max_y = y
 				new_controller.end_y = y
 
-				process_xinput_digital_button(old_controller.a, &new_controller.a, .A, pad.wButtons)
-				process_xinput_digital_button(old_controller.b, &new_controller.b, .B, pad.wButtons)
-				process_xinput_digital_button(old_controller.x, &new_controller.x, .X, pad.wButtons)
-				process_xinput_digital_button(old_controller.y, &new_controller.y, .Y, pad.wButtons)
-				process_xinput_digital_button(
+				win32_process_xinput_digital_button(old_controller.a, &new_controller.a, .A, pad.wButtons)
+				win32_process_xinput_digital_button(old_controller.b, &new_controller.b, .B, pad.wButtons)
+				win32_process_xinput_digital_button(old_controller.x, &new_controller.x, .X, pad.wButtons)
+				win32_process_xinput_digital_button(old_controller.y, &new_controller.y, .Y, pad.wButtons)
+				win32_process_xinput_digital_button(
 					old_controller.left_shoulder,
 					&new_controller.left_shoulder,
 					.LEFT_SHOULDER,
 					pad.wButtons,
 				)
-				process_xinput_digital_button(
+				win32_process_xinput_digital_button(
 					old_controller.right_shoulder,
 					&new_controller.right_shoulder,
 					.RIGHT_SHOULDER,
 					pad.wButtons,
 				)
 
-				start := .START in pad.wButtons
-				back := .BACK in pad.wButtons
+				// start := .START in pad.wButtons
+				// back := .BACK in pad.wButtons
 
 				// TODO: remove when we replace
 				//xOffset += i32(stick_x / 4096)
@@ -537,7 +551,7 @@ main :: proc() {
 		// TODO: Tighten up sound logic so that we know where we should be
 		// writing to and can anticipate the time spent in the game update.
 		if hr := secondary_sound_buffer->getCurrentPosition(&play_cursor, &write_cursor); hr < 0 {
-			_, _, code := win32.DECODE_HRESULT(hr)
+			_, _, code := DECODE_HRESULT(hr)
 			// NOTE: Casey doesn't panic, and has a "SoundIsValid" bool set to true if this succeeds. Weird?
 			show_error_and_panic(fmt.tprintf("Error in GetCurrentPosition: code 0x%X\n", code))
 		}
@@ -558,7 +572,7 @@ main :: proc() {
 			samples            = samples, //raw_data(samples[:]),
 		}
 		buffer := Game_Offscreen_Buffer {
-			memory = transmute([^]u8)raw_data(GlobalBackBuffer.memory),
+			memory = raw_data(GlobalBackBuffer.memory),
 			width  = GlobalBackBuffer.width,
 			height = GlobalBackBuffer.height,
 			pitch  = GlobalBackBuffer.pitch,
@@ -574,25 +588,24 @@ main :: proc() {
 		win32_display_buffer_in_window(&GlobalBackBuffer, deviceContext, dims.width, dims.height)
 
 		// Frame timings
-		end_counter: win32.LARGE_INTEGER
-		win32.QueryPerformanceCounter(&end_counter)
-
-		counter_elapsed := end_counter - last_counter
-		ms_elapsed := f32(1000 * counter_elapsed) / f32(perf_counter_frequency)
-		fps := f32(perf_counter_frequency) / f32(counter_elapsed)
-
-		//  5.5367, FPS: 180.613007, cycles: 16
-		// using rdtsc
-		end_cycle_count := x86._rdtsc()
-		cycles_elapsed := end_cycle_count - last_cycle_count
-		mcpf := cycles_elapsed / (1000 * 1000)
-
 		when false {
-			win32.OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
-		}
+			end_counter: LARGE_INTEGER
+			QueryPerformanceCounter(&end_counter)
 
-		last_counter = end_counter
-		last_cycle_count = end_cycle_count
+			ms_elapsed := f32(1000 * counter_elapsed) / f32(perf_counter_frequency)
+			counter_elapsed := end_counter - last_counter
+			fps := f32(perf_counter_frequency) / f32(counter_elapsed)
+
+			// using rdtsc
+			end_cycle_count := x86._rdtsc()
+			cycles_elapsed := end_cycle_count - last_cycle_count
+			mcpf := cycles_elapsed / (1000 * 1000)
+
+			OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
+
+			last_counter = end_counter
+			last_cycle_count = end_cycle_count
+		}
 
 		new_input, old_input = old_input, new_input
 	}
