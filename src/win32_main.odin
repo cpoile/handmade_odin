@@ -29,6 +29,7 @@ import "core:dynlib"
 import "core:fmt"
 import "core:log"
 import "core:math"
+import bits "core:math/bits"
 import "core:mem"
 import "core:simd/x86"
 import "core:strings"
@@ -44,8 +45,8 @@ BYTES_PER_SAMPLE :: size_of(i16) * 2
 BUFFER_SIZE :: SAMPLE_RATE * BYTES_PER_SAMPLE
 
 Game_Memory :: struct {
-	permanent:     []u8, // NOTE: REQUIRED to be initialized to zero at startup. Windows does, make sure other platforms do.
-	temporary:     []u8,
+	permanent: []u8, // NOTE: REQUIRED to be initialized to zero at startup. Windows does, make sure other platforms do.
+	temporary: []u8,
 }
 
 Game_State :: struct {
@@ -77,6 +78,70 @@ win32_sound_output :: struct {
 global_running := true
 GlobalBackBuffer: offscreen_buffer
 secondary_sound_buffer: ^dsound.Buffer
+
+// Services that the platform layer provides the game
+//
+// should be using a when here, but it ruins ols, so no can do (until ols is when-aware)
+//when HANDMADE_INTERNAL {
+//
+// NOTE: These are not for anything in the shipping game.
+//  They are blocking and the write doesn't protect against lost data!
+DEBUG_platform_read_entire_file :: proc(filename: string) -> (memory: []u8, ok: bool) {
+	fh := win32.CreateFileW(
+		win32.utf8_to_wstring(filename),
+		win32.GENERIC_READ,
+		win32.FILE_SHARE_READ,
+		nil,
+		win32.OPEN_EXISTING,
+		0,
+		nil,
+	)
+
+	if fh == nil {return}
+
+	size: win32.LARGE_INTEGER
+	win32.GetFileSizeEx(fh, &size) or_return
+	
+	assert(size < bits.U32_MAX)
+
+	raw_mem := win32.VirtualAlloc(nil, uint(size), win32.MEM_RESERVE | win32.MEM_COMMIT, win32.PAGE_READWRITE)
+
+	if raw_mem == nil {return nil, false}
+
+	memory = mem.byte_slice(raw_mem, size)
+
+	defer if !ok {
+		DEBUG_platform_free_file_memory(&memory)
+	}
+
+	bytes_read: win32.DWORD
+	win32.ReadFile(fh, raw_mem, u32(size), &bytes_read, nil) or_return
+
+	if bytes_read != u32(size) {return}
+
+	win32.CloseHandle(fh) or_return
+
+	return memory, true
+}
+
+DEBUG_platform_free_file_memory :: proc(memory: ^[]u8) {
+	raw := transmute(mem.Raw_Slice)memory^
+	win32.VirtualFree(raw.data, 0, win32.MEM_RELEASE)
+	raw.len = 0
+	memory^ = transmute([]u8)raw
+}
+DEBUG_platform_write_entire_file :: proc(filename: string, memory: []u8) -> (ok: bool) {
+	fh := win32.CreateFileW(win32.utf8_to_wstring(filename), win32.GENERIC_WRITE, 0, nil, win32.CREATE_ALWAYS, 0, nil)
+
+	if fh == nil {return}
+
+	bytes_written: win32.DWORD
+	win32.WriteFile(fh, raw_data(memory), cast(u32)len(memory), &bytes_written, nil) or_return
+
+	return bytes_written == cast(u32)len(memory)
+}
+//}
+
 
 win32_fill_sound_buffer :: proc(
 	sound_output: ^win32_sound_output,
@@ -354,9 +419,9 @@ main :: proc() {
 	// NOTE: Casey uses VirtualAlloc, so I'm going to do the same (for now). We're simulating our own allocator, so why not go raw.
 
 	when HANDMADE_INTERNAL {
-		base_address : win32.LPVOID = transmute(rawptr)TERABYTES(2)  // in windows 64-bit, first 8 terabytes are reserved for the application
+		base_address: win32.LPVOID = transmute(rawptr)TERABYTES(2) // in windows 64-bit, first 8 terabytes are reserved for the application
 	} else {
-		base_address : win32.LPVOID = nil
+		base_address: win32.LPVOID = nil
 	}
 	game_memory := Game_Memory{}
 	permanent_len := MEGABYTES(64)
@@ -498,7 +563,11 @@ main :: proc() {
 			height = GlobalBackBuffer.height,
 			pitch  = GlobalBackBuffer.pitch,
 		}
-		game_update_and_render(&game_memory, new_input, &buffer, &game_sound_buffer)
+		if !game_update_and_render(&game_memory, new_input, &buffer, &game_sound_buffer) {
+			show_error_and_panic(
+				"game_update_and_render returned false, exiting. We'll work out proper error handling soon I hope.\n",
+			)
+		}
 		win32_fill_sound_buffer(&sound_output, &game_sound_buffer, bytes_to_lock, bytes_to_write)
 
 		dims := get_window_dimensions(windowHandle)
