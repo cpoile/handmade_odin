@@ -28,6 +28,7 @@ import "base:runtime"
 import "core:fmt"
 import bits "core:math/bits"
 import "core:mem"
+import "core:simd/x86"
 import "core:strings"
 import win32 "core:sys/windows"
 
@@ -74,6 +75,7 @@ win32_sound_output :: struct {
 global_running := true
 GlobalBackBuffer: offscreen_buffer
 secondary_sound_buffer: ^dsound.Buffer
+global_perf_counter_frequency: win32.LARGE_INTEGER
 
 // Services that the platform layer provides the game
 //
@@ -392,14 +394,26 @@ win32_process_messages :: proc(keyboard_controller: ^Game_Controller_Input) {
 	}
 }
 
+win32_get_wall_clock :: #force_inline proc() -> win32.LARGE_INTEGER {
+	res: win32.LARGE_INTEGER
+	win32.QueryPerformanceCounter(&res)
+	return res
+}
+
+win32_get_seconds_elapsed :: #force_inline proc(start: win32.LARGE_INTEGER, end: win32.LARGE_INTEGER) -> f32 {
+	return f32(end - start) / f32(global_perf_counter_frequency)
+}
+
 main :: proc() {
 	using win32
 
-	perf_counter_frequency: LARGE_INTEGER
-	QueryPerformanceFrequency(&perf_counter_frequency)
-
-
 	backtrace.register_segfault_handler()
+
+	QueryPerformanceFrequency(&global_perf_counter_frequency)
+
+	// NOTE: Set the windows scheduler granularity, so our sleep can be better
+	desired_scheduler_ms :: 1
+	sleep_is_granular := timeBeginPeriod(desired_scheduler_ms) == TIMERR_NOERROR
 
 	instance := HINSTANCE(GetModuleHandleW(nil))
 	if (instance == nil) {show_error_and_panic("No instance")}
@@ -419,6 +433,12 @@ main :: proc() {
 	// NOTE: since we specified CS_OWNDC, we can just get one device context and use it
 	// forever because we are not sharing it with anyone.
 	deviceContext := GetDC(windowHandle)
+
+	monitor_refresh_hz := 60
+	// TODO: how do we reliably query this on Windows?
+	game_update_hz := 30
+	target_ms_per_game_update := 1000 / f32(game_update_hz)
+	target_seconds_per_frame := f32(1) / f32(monitor_refresh_hz)
 
 	// NOTE: sound test
 	sound_output := win32_sound_output {
@@ -456,14 +476,12 @@ main :: proc() {
 	game_memory.temporary = mem.byte_slice(cast(rawptr)(uintptr(raw_mem) + uintptr(permanent_len)), temporary_len)
 
 	// Frame timings
-	when false {
-		last_counter: LARGE_INTEGER
-		last_cycle_count := x86._rdtsc()
-		QueryPerformanceCounter(&last_counter)
-	}
+	last_counter := win32_get_wall_clock()
+	last_cycle_count := x86._rdtsc()
 
 	new_input := &Game_Input{}
 	old_input := &Game_Input{}
+
 
 	for (global_running) {
 		using xinput
@@ -471,7 +489,9 @@ main :: proc() {
 		// zero the keyboard at the start of each frame
 		old_keyboard_controller := &old_input.controllers[0]
 		new_keyboard_controller := &new_input.controllers[0]
-		new_keyboard_controller^ = {isConnected = true}
+		new_keyboard_controller^ = {
+			isConnected = true,
+		}
 		for i in 0 ..< 10 {
 			new_keyboard_controller.buttons[i].ended_down = old_keyboard_controller.buttons[i].ended_down
 		}
@@ -583,6 +603,7 @@ main :: proc() {
 			bytes_to_write = target_cursor - bytes_to_lock // we only have to fill from bytes_to_lock up to the play_cursor
 		}
 
+		// TODO: sound is wrong now, it hasn't been updated to go with the new frame loop (but it works b/c I'm keeping mine at 60fps)
 		game_sound_buffer := Game_Sound_Buffer {
 			samples_per_second = SAMPLE_RATE,
 			sample_count       = bytes_to_write / BYTES_PER_SAMPLE,
@@ -601,28 +622,41 @@ main :: proc() {
 		}
 		win32_fill_sound_buffer(&sound_output, &game_sound_buffer, bytes_to_lock, bytes_to_write)
 
+		// Frame timings
+		work_counter := win32_get_wall_clock()
+		work_sec_elapsed := win32_get_seconds_elapsed(last_counter, work_counter)
+
+		sec_elapsed_for_frame := work_sec_elapsed
+		if sec_elapsed_for_frame < target_seconds_per_frame {
+			if sleep_is_granular {
+				sleep_ms := u32(1000 * (target_seconds_per_frame - sec_elapsed_for_frame))
+				if sleep_ms > 0 do win32.Sleep(sleep_ms)
+			}
+			assert(sec_elapsed_for_frame < target_seconds_per_frame)
+			for sec_elapsed_for_frame < target_seconds_per_frame {
+				sec_elapsed_for_frame = win32_get_seconds_elapsed(last_counter, win32_get_wall_clock())
+			}
+		} else {
+			fmt.printf("sec_elapsed_for_frame > target_seconds_per_frame, missed a frame!")
+		}
+
+		// Display the frame
 		dims := get_window_dimensions(windowHandle)
 		win32_display_buffer_in_window(&GlobalBackBuffer, deviceContext, dims.width, dims.height)
 
-		// Frame timings
-		when false {
-			end_counter: LARGE_INTEGER
-			QueryPerformanceCounter(&end_counter)
+		end_counter := win32_get_wall_clock()
+		ms_per_frame := f32(1000) * win32_get_seconds_elapsed(last_counter, end_counter)
+		fps := 0.0
 
-			ms_elapsed := f32(1000 * counter_elapsed) / f32(perf_counter_frequency)
-			counter_elapsed := end_counter - last_counter
-			fps := f32(perf_counter_frequency) / f32(counter_elapsed)
+		// using rdtsc
+		end_cycle_count := x86._rdtsc()
+		cycles_elapsed := end_cycle_count - last_cycle_count
+		mcpf := cycles_elapsed / (1000 * 1000)
 
-			// using rdtsc
-			end_cycle_count := x86._rdtsc()
-			cycles_elapsed := end_cycle_count - last_cycle_count
-			mcpf := cycles_elapsed / (1000 * 1000)
+		OutputDebugStringA(fmt.ctprintf("ms_per_frame: %.2f, FPS: %.2f, cycles: %d mc\n", ms_per_frame, fps, mcpf))
 
-			OutputDebugStringA(fmt.ctprintf("ms_elapsed: %.2f, FPS: %.2f, cycles: %d mc\n", ms_elapsed, fps, mcpf))
-
-			last_counter = end_counter
-			last_cycle_count = end_cycle_count
-		}
+		last_counter = win32_get_wall_clock()
+		last_cycle_count = end_cycle_count
 
 		new_input, old_input = old_input, new_input
 	}
