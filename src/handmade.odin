@@ -25,9 +25,9 @@ MAX_INPUTS :: MAX_CONTROLLER_COUNT + 1 // for keyboard
 Game_Offscreen_Buffer :: struct {
 	// NOTE: Pixels are always 32-bits wide, Memory Order BB GG RR XX
 	memory: [^]u8,
-	width:  i32,
-	height: i32,
-	pitch:  i32,
+	width:  u32,
+	height: u32,
+	pitch:  u32,
 }
 
 Game_Sound_Buffer :: struct {
@@ -63,8 +63,8 @@ render_weird_gradient :: proc(back_buffer: ^Game_Offscreen_Buffer, blue_offset: 
 			//                   1  2  3  4
 			// pixel in memory: BB GG RR xx  (bc MSFT wanted to see RGB in register (see register)
 			//     in register: xx RR GG BB  (bc it's little endian)
-			bb := u8(x + blue_offset)
-			gg := u8(y + yOffset)
+			bb := u8(i32(x) + blue_offset)
+			gg := u8(i32(y) + yOffset)
 			pixel[0] = (u32(gg) << 8) | u32(bb)
 			pixel = pixel[1:]
 		}

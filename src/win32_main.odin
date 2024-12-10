@@ -39,7 +39,13 @@ int2 :: [2]i32
 // consts
 SAMPLE_RATE: u32 : 44100
 BYTES_PER_SAMPLE :: size_of(i16) * 2
-BUFFER_SIZE :: SAMPLE_RATE * BYTES_PER_SAMPLE
+SOUND_BUFFER_SIZE :: SAMPLE_RATE * BYTES_PER_SAMPLE
+FRAMES_OF_AUDIO_LATENCY :: 3
+// TODO: how do we reliably query this on Windows?
+MONITOR_REFRESH_HZ :: 60
+GAME_UPDATE_HZ :: 30
+TARGET_MS_PER_GAME_UPDATE :: 1000 / f32(GAME_UPDATE_HZ)
+TARGET_SECONDS_PER_FRAME :: f32(1) / f32(GAME_UPDATE_HZ)
 
 Game_Memory :: struct {
 	permanent: []u8, // NOTE: REQUIRED to be initialized to zero at startup. Windows does, make sure other platforms do.
@@ -54,11 +60,12 @@ Game_State :: struct {
 }
 
 offscreen_buffer :: struct {
-	BitmapInfo: win32.BITMAPINFO,
-	memory:     []u8,
-	width:      i32,
-	height:     i32,
-	pitch:      i32,
+	BitmapInfo:      win32.BITMAPINFO,
+	memory:          []u8,
+	width:           u32,
+	height:          u32,
+	pitch:           u32,
+	bytes_per_pixel: u32,
 }
 
 win32_window_dimensions :: struct {
@@ -74,7 +81,7 @@ win32_sound_output :: struct {
 
 global_running := true
 GlobalBackBuffer: offscreen_buffer
-secondary_sound_buffer: ^dsound.Buffer
+sound_buffer: ^dsound.Buffer
 global_perf_counter_frequency: win32.LARGE_INTEGER
 
 // Services that the platform layer provides the game
@@ -150,9 +157,7 @@ win32_fill_sound_buffer :: proc(
 	// [left right] [left right] [left right]
 	region1, region2: rawptr
 	size1, size2: u32
-	if win32.SUCCEEDED(
-		secondary_sound_buffer->lock(byte_to_lock, bytes_to_write, &region1, &size1, &region2, &size2, 0),
-	) {
+	if win32.SUCCEEDED(sound_buffer->lock(byte_to_lock, bytes_to_write, &region1, &size1, &region2, &size2, 0)) {
 		region1_sample_count := size1 / BYTES_PER_SAMPLE
 		dest_samples := cast([^]i16)region1
 		src_samples := source_buffer.samples
@@ -179,7 +184,7 @@ win32_fill_sound_buffer :: proc(
 			src_samples = src_samples[1:]
 			sound_output.running_sample_index += 1
 		}
-		secondary_sound_buffer->unlock(region1, size1, region2, size2)
+		sound_buffer->unlock(region1, size1, region2, size2)
 	}
 }
 
@@ -189,24 +194,24 @@ get_window_dimensions :: proc(window: win32.HWND) -> win32_window_dimensions {
 	return {client_rect.right - client_rect.left, client_rect.bottom - client_rect.top}
 }
 
-win32_resize_DIB_section :: proc(back_buffer: ^offscreen_buffer, width: i32, height: i32) {
+win32_resize_DIB_section :: proc(back_buffer: ^offscreen_buffer, width: u32, height: u32) {
 	if (back_buffer.memory != nil) {delete(back_buffer.memory)}
 	back_buffer.width = width
 	back_buffer.height = height
-	bytes_per_pixel :: 4
-	back_buffer.pitch = width * bytes_per_pixel
+	back_buffer.bytes_per_pixel = 4
+	back_buffer.pitch = width * back_buffer.bytes_per_pixel
 
 	// NOTE: When the biHeight field is negative, this is the clue to Windows to treat this bitmap as top down, not
 	// bottom up, meaning that the first 3 bytes of the image are the color for the top left pixel in the bitmap,
 	// not the bottom left
 	back_buffer.BitmapInfo.bmiHeader.biSize = size_of(type_of(back_buffer.BitmapInfo.bmiHeader))
-	back_buffer.BitmapInfo.bmiHeader.biWidth = width
-	back_buffer.BitmapInfo.bmiHeader.biHeight = -height
+	back_buffer.BitmapInfo.bmiHeader.biWidth = i32(width)
+	back_buffer.BitmapInfo.bmiHeader.biHeight = i32(-height)
 	back_buffer.BitmapInfo.bmiHeader.biPlanes = 1
 	back_buffer.BitmapInfo.bmiHeader.biBitCount = 32
 	back_buffer.BitmapInfo.bmiHeader.biCompression = win32.BI_RGB
 
-	bitmap_memory_size := uint((back_buffer.width * back_buffer.height) * bytes_per_pixel)
+	bitmap_memory_size := uint((back_buffer.width * back_buffer.height) * back_buffer.bytes_per_pixel)
 	back_buffer.memory = make([]byte, bitmap_memory_size)
 }
 
@@ -225,14 +230,46 @@ win32_display_buffer_in_window :: proc(
 		destHeight,
 		0,
 		0,
-		back_buffer.width,
-		back_buffer.height,
+		i32(back_buffer.width),
+		i32(back_buffer.height),
 		raw_data(back_buffer.memory),
 		&back_buffer.BitmapInfo,
 		win32.DIB_RGB_COLORS,
 		win32.SRCCOPY,
 	)
 }
+
+win32_debug_draw_vertical :: proc(back_buffer: ^offscreen_buffer, x: u32, top: u32, bottom: u32, color: u32) {
+	pixel := back_buffer.memory[x * back_buffer.bytes_per_pixel + top * back_buffer.pitch:]
+	for y in top ..< bottom {
+		(cast([^]u32)raw_data(pixel))[0] = color
+		pixel = pixel[back_buffer.pitch:]
+	}
+}
+
+win32_debug_sync_display :: proc(
+	back_buffer: ^offscreen_buffer,
+	last_play_cursor_count: int,
+	last_play_cursors: []u32,
+	sound_output: ^win32_sound_output,
+) {
+	// TODO: draw where we're writing out sound
+
+	pad_x: u32 = 16
+	pad_y: u32 = 16
+	top := pad_y
+	bottom: u32 = back_buffer.height - 16
+
+	// remember Casey's talk on dimentional analysis: to change something mapped in sound buffer size into back_buffer size,
+	// mult by coefficient C. The sound buffer sized thing cancels out with the denominator, leaving back_buffer units.
+	C := f32(back_buffer.width - 2 * pad_x) / f32(SOUND_BUFFER_SIZE)
+	for i in 0 ..< len(last_play_cursors) {
+		last_play_cursor := last_play_cursors[i]
+		x := pad_x + u32(C * f32(last_play_cursor))
+		win32_debug_draw_vertical(back_buffer, x, top, bottom, 0xFFFFFFFF)
+	}
+}
+
 
 win32_main_window_callback :: proc "system" (
 	window: win32.HWND,
@@ -414,6 +451,7 @@ main :: proc() {
 	// NOTE: Set the windows scheduler granularity, so our sleep can be better
 	desired_scheduler_ms :: 1
 	sleep_is_granular := timeBeginPeriod(desired_scheduler_ms) == TIMERR_NOERROR
+	defer timeEndPeriod(desired_scheduler_ms)
 
 	instance := HINSTANCE(GetModuleHandleW(nil))
 	if (instance == nil) {show_error_and_panic("No instance")}
@@ -427,33 +465,27 @@ main :: proc() {
 	ShowWindow(windowHandle, SW_SHOWDEFAULT)
 	UpdateWindow(windowHandle)
 
-	win32_resize_DIB_section(&GlobalBackBuffer, size.x, size.y)
+	win32_resize_DIB_section(&GlobalBackBuffer, u32(size.x), u32(size.y))
 	defer delete(GlobalBackBuffer.memory)
 
 	// NOTE: since we specified CS_OWNDC, we can just get one device context and use it
 	// forever because we are not sharing it with anyone.
 	deviceContext := GetDC(windowHandle)
 
-	monitor_refresh_hz := 60
-	// TODO: how do we reliably query this on Windows?
-	game_update_hz := 30
-	target_ms_per_game_update := 1000 / f32(game_update_hz)
-	target_seconds_per_frame := f32(1) / f32(monitor_refresh_hz)
-
 	// NOTE: sound test
 	sound_output := win32_sound_output {
-		latency_sample_count = SAMPLE_RATE / 15,
+		latency_sample_count = FRAMES_OF_AUDIO_LATENCY * (SAMPLE_RATE / GAME_UPDATE_HZ),
 	}
 
-	dsound.load(windowHandle, &secondary_sound_buffer, BUFFER_SIZE, SAMPLE_RATE)
+	dsound.load(windowHandle, &sound_buffer, SOUND_BUFFER_SIZE, SAMPLE_RATE)
 	// no need to clear the secondary_sound_buffer in Odin, it's initialized to zero.
-	if hr := secondary_sound_buffer->play(0, 0, dsound.DSBPLAY_LOOPING); hr < 0 {
+	if hr := sound_buffer->play(0, 0, dsound.DSBPLAY_LOOPING); hr < 0 {
 		_, _, code := DECODE_HRESULT(hr)
 		show_error_and_panic(fmt.tprintf("Error in Play: code 0x%X\n", code))
 	}
 
 	// TODO: pool with bitmap make -- needed for odin? maybe not...
-	samples := make([]i16, BUFFER_SIZE / 2) // BUFFER_SIZE is in bytes, therefore
+	samples := make([]i16, SOUND_BUFFER_SIZE / 2) // BUFFER_SIZE is in bytes, therefore
 	defer delete(samples)
 
 	// NOTE: Casey uses VirtualAlloc, so I'm going to do the same (for now). We're simulating our own allocator, so why not go raw.
@@ -479,9 +511,15 @@ main :: proc() {
 	last_counter := win32_get_wall_clock()
 	last_cycle_count := x86._rdtsc()
 
+	// TODO: handle startup specially
+	last_play_cursor : u32 = 0
+	sound_is_valid := false
+
+	debug_last_play_cursor_index := 0
+	debug_last_play_cursor: [GAME_UPDATE_HZ / 2]u32 = 0
+
 	new_input := &Game_Input{}
 	old_input := &Game_Input{}
-
 
 	for (global_running) {
 		using xinput
@@ -579,35 +617,23 @@ main :: proc() {
 			}
 		}
 
-		// vibration: XINPUT_VIBRATION = {60000, 60000};
-		// XInputSetState(0, &vibration)
+		bytes_to_lock, target_cursor, bytes_to_write: u32
+		if sound_is_valid {
+			bytes_to_lock = (sound_output.running_sample_index * BYTES_PER_SAMPLE) % SOUND_BUFFER_SIZE
+			target_cursor = (last_play_cursor + (sound_output.latency_sample_count * BYTES_PER_SAMPLE)) % SOUND_BUFFER_SIZE
 
-		// DirectSound output test
-		bytes_to_lock, target_cursor, bytes_to_write, play_cursor, write_cursor: u32
-
-		// TODO: Tighten up sound logic so that we know where we should be
-		// writing to and can anticipate the time spent in the game update.
-		if hr := secondary_sound_buffer->getCurrentPosition(&play_cursor, &write_cursor); hr < 0 {
-			_, _, code := DECODE_HRESULT(hr)
-			// NOTE: Casey doesn't panic, and has a "SoundIsValid" bool set to true if this succeeds. Weird?
-			show_error_and_panic(fmt.tprintf("Error in GetCurrentPosition: code 0x%X\n", code))
+			if bytes_to_lock > target_cursor {
+				bytes_to_write = SOUND_BUFFER_SIZE - bytes_to_lock // we have this much ahead of us in the buffer to write to
+				bytes_to_write += target_cursor // and add the first part of the buffer up to the play cursor
+			} else {
+				bytes_to_write = target_cursor - bytes_to_lock // we only have to fill from bytes_to_lock up to the play_cursor
+			}
 		}
 
-		bytes_to_lock = (sound_output.running_sample_index * BYTES_PER_SAMPLE) % BUFFER_SIZE
-		target_cursor = (play_cursor + (sound_output.latency_sample_count * BYTES_PER_SAMPLE)) % BUFFER_SIZE
-
-		if bytes_to_lock > target_cursor {
-			bytes_to_write = BUFFER_SIZE - bytes_to_lock // we have this much ahead of us in the buffer to write to
-			bytes_to_write += target_cursor // and add the first part of the buffer up to the play cursor
-		} else {
-			bytes_to_write = target_cursor - bytes_to_lock // we only have to fill from bytes_to_lock up to the play_cursor
-		}
-
-		// TODO: sound is wrong now, it hasn't been updated to go with the new frame loop (but it works b/c I'm keeping mine at 60fps)
 		game_sound_buffer := Game_Sound_Buffer {
 			samples_per_second = SAMPLE_RATE,
 			sample_count       = bytes_to_write / BYTES_PER_SAMPLE,
-			samples            = samples, //raw_data(samples[:]),
+			samples            = samples,
 		}
 		buffer := Game_Offscreen_Buffer {
 			memory = raw_data(GlobalBackBuffer.memory),
@@ -623,39 +649,75 @@ main :: proc() {
 		win32_fill_sound_buffer(&sound_output, &game_sound_buffer, bytes_to_lock, bytes_to_write)
 
 		// Frame timings
+		// TODO: not tested yet, probably buggy!!!
 		work_counter := win32_get_wall_clock()
 		work_sec_elapsed := win32_get_seconds_elapsed(last_counter, work_counter)
 
 		sec_elapsed_for_frame := work_sec_elapsed
-		if sec_elapsed_for_frame < target_seconds_per_frame {
+		if sec_elapsed_for_frame < TARGET_SECONDS_PER_FRAME {
 			if sleep_is_granular {
-				sleep_ms := u32(1000 * (target_seconds_per_frame - sec_elapsed_for_frame))
+				// -1 b/c it was oversleeping on my machine (different than casey's, not sure why. But this gives us a solid 33.33 ms/frame)
+				sleep_ms := u32(1000 * (TARGET_SECONDS_PER_FRAME - sec_elapsed_for_frame)) - 1
 				if sleep_ms > 0 do win32.Sleep(sleep_ms)
 			}
-			assert(sec_elapsed_for_frame < target_seconds_per_frame)
-			for sec_elapsed_for_frame < target_seconds_per_frame {
+
+			test_sec_elapsed_for_frame := win32_get_seconds_elapsed(last_counter, win32_get_wall_clock())
+			assert(test_sec_elapsed_for_frame < TARGET_SECONDS_PER_FRAME)
+
+			sec_elapsed_for_frame = win32_get_seconds_elapsed(last_counter, win32_get_wall_clock())
+			for sec_elapsed_for_frame < TARGET_SECONDS_PER_FRAME {
 				sec_elapsed_for_frame = win32_get_seconds_elapsed(last_counter, win32_get_wall_clock())
 			}
 		} else {
-			fmt.printf("sec_elapsed_for_frame > target_seconds_per_frame, missed a frame!")
+			fmt.printf("missed a frame! sec_elapsed_for_frame > target_seconds_per_frame")
 		}
-
-		// Display the frame
-		dims := get_window_dimensions(windowHandle)
-		win32_display_buffer_in_window(&GlobalBackBuffer, deviceContext, dims.width, dims.height)
 
 		end_counter := win32_get_wall_clock()
 		ms_per_frame := f32(1000) * win32_get_seconds_elapsed(last_counter, end_counter)
-		fps := 0.0
+		last_counter = end_counter
+
+		// Display the frame
+		dims := get_window_dimensions(windowHandle)
+
+		when HANDMADE_INTERNAL {
+			win32_debug_sync_display(
+				&GlobalBackBuffer,
+				debug_last_play_cursor_index,
+				debug_last_play_cursor[:],
+				&sound_output,
+			)
+		}
+		win32_display_buffer_in_window(&GlobalBackBuffer, deviceContext, dims.width, dims.height)
+
+		// We want the play cursor that we sampled back when we flipped the previous frame, and we want to add our frame latency into that.
+		play_cursor: u32
+		write_cursor: u32
+		if hr := sound_buffer->getCurrentPosition(&play_cursor, &write_cursor); hr < 0 {
+			_, _, code := DECODE_HRESULT(hr)
+			show_error(fmt.tprintf("Error in GetCurrentPosition: code 0x%X\n", code))
+			sound_is_valid = false
+		} else {
+			last_play_cursor = play_cursor
+			sound_is_valid = true
+		}
+
+		when HANDMADE_INTERNAL {
+			// NOTE: this is debug code
+			{
+				debug_last_play_cursor[debug_last_play_cursor_index] = play_cursor
+				debug_last_play_cursor_index += 1
+				debug_last_play_cursor_index %= len(debug_last_play_cursor)
+			}
+		}
 
 		// using rdtsc
 		end_cycle_count := x86._rdtsc()
 		cycles_elapsed := end_cycle_count - last_cycle_count
 		mcpf := cycles_elapsed / (1000 * 1000)
+		fps := 0.0
 
 		OutputDebugStringA(fmt.ctprintf("ms_per_frame: %.2f, FPS: %.2f, cycles: %d mc\n", ms_per_frame, fps, mcpf))
 
-		last_counter = win32_get_wall_clock()
 		last_cycle_count = end_cycle_count
 
 		new_input, old_input = old_input, new_input
@@ -665,4 +727,8 @@ main :: proc() {
 show_error_and_panic :: proc(msg: string) {
 	win32.OutputDebugStringA(strings.unsafe_string_to_cstring(msg))
 	panic(msg)
+}
+
+show_error :: proc(msg: string) {
+	win32.OutputDebugStringA(strings.unsafe_string_to_cstring(msg))
 }
