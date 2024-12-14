@@ -114,13 +114,20 @@ Game_Input :: struct {
 	controllers: [MAX_INPUTS]Game_Controller_Input,
 }
 
+// NOTE: at the moment this has to be a very fast function, it cannot be more than a ms or so.
+game_get_sound_samples :: proc(game_memory: ^Game_Memory, sound_buffer: ^Game_Sound_Buffer) {
+	// TODO: Allow sample offsets here (eg, set sound further out in the future, or closer to immediately)
+	state := (^Game_State)(raw_data(game_memory.permanent))
+
+	game_sound_output(sound_buffer, state.tone_hz)
+}
+
 // NOTE: may expand in the future
 // need FOUR THINGS: timing, controller/keyboard input, bitmap buffer to use, sound buffer to use
 game_update_and_render :: proc(
 	game_memory: ^Game_Memory,
 	input: ^Game_Input,
 	back_buffer: ^Game_Offscreen_Buffer,
-	sound_buffer: ^Game_Sound_Buffer,
 ) -> bool {
 	when ODIN_DEBUG {
 		assert(size_of(Game_State) <= len(game_memory.permanent))
@@ -149,18 +156,15 @@ game_update_and_render :: proc(
 		if input.analog {
 			// NOTE: Use analog movement tuning
 			state.tone_hz = cast(u32)math.clamp(261 + 64.0 * input.stick_avg_y, 120, 1566)
-			state.blue_offset += i32(input.stick_avg_x * 4)
-			state.green_offset -= i32(input.stick_avg_y * 4)
+			state.blue_offset += cast(i32)(input.stick_avg_x * 10)
+			state.green_offset -= cast(i32)(input.stick_avg_y * 10)
 		}
 
-		state.blue_offset += i32(input.move_right.ended_down ? 1 : 0 * 4)
-		state.blue_offset -= i32(input.move_left.ended_down ? 1 : 0 * 4)
-		state.green_offset -= i32(input.move_up.ended_down ? 1 : 0 * 4)
-		state.green_offset += i32(input.move_down.ended_down ? 1 : 0 * 4)
+		state.blue_offset += (input.move_right.ended_down ? 1 : 0) * 10
+		state.blue_offset -= (input.move_left.ended_down ? 1 : 0) * 10
+		state.green_offset -= (input.move_up.ended_down ? 1 : 0) * 10
+		state.green_offset += (input.move_down.ended_down ? 1 : 0) * 10
 	}
-
-	// TODO: Allow sample offsets here (eg, set sound further out in the future, or closer to immediately)
-	game_sound_output(sound_buffer, state.tone_hz)
 
 	render_weird_gradient(back_buffer, state.blue_offset, state.green_offset)
 
